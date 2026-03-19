@@ -9,3 +9,8 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+.venv_pg/
+.agents/
+skills-lock.json
+toy_model/runs/
+toy_model/tmp_*.yaml

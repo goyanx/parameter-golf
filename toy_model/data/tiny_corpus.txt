@@ -1,0 +1,15 @@
+This is a tiny corpus for local language model experiments.
+Parameter golf rewards efficient model design under strict constraints.
+Every byte must justify its existence.
+Weight sharing, quantization, pruning, and low-rank layers can all help.
+Repeat this text to create enough tokens for quick debugging runs.
+This is a tiny corpus for local language model experiments.
+Parameter golf rewards efficient model design under strict constraints.
+Every byte must justify its existence.
+Weight sharing, quantization, pruning, and low-rank layers can all help.
+Repeat this text to create enough tokens for quick debugging runs.
+This is a tiny corpus for local language model experiments.
+Parameter golf rewards efficient model design under strict constraints.
+Every byte must justify its existence.
+Weight sharing, quantization, pruning, and low-rank layers can all help.
+Repeat this text to create enough tokens for quick debugging runs.

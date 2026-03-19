@@ -85,6 +85,25 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    # Optional stabilization/compression knobs (off by default).
+    prune_amount = float(os.environ.get("PRUNE_AMOUNT", 0.0))
+    prune_progressive = bool(int(os.environ.get("PRUNE_PROGRESSIVE", "0")))
+    prune_start_step = int(os.environ.get("PRUNE_START_STEP", -1))
+    prune_end_step = int(os.environ.get("PRUNE_END_STEP", -1))
+    prune_every = int(os.environ.get("PRUNE_EVERY", 100))
+    prune_exclude = tuple(
+        p.strip()
+        for p in os.environ.get("PRUNE_EXCLUDE", "tok_emb,lm_head,final_norm,skip_weights").split(",")
+        if p.strip()
+    )
+    qat_int8_enabled = bool(int(os.environ.get("QAT_INT8_ENABLED", "0")))
+    qat_int8_start_step = int(os.environ.get("QAT_INT8_START_STEP", -1))
+    qat_int8_every = int(os.environ.get("QAT_INT8_EVERY", 1))
+    qat_int8_exclude = tuple(
+        p.strip()
+        for p in os.environ.get("QAT_INT8_EXCLUDE", "tok_emb,lm_head,final_norm,skip_weights").split(",")
+        if p.strip()
+    )
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -420,6 +439,58 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
             out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
         out[name] = out_t
     return out
+
+
+def _name_excluded(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(p in name for p in patterns)
+
+
+@torch.no_grad()
+def magnitude_prune_model_inplace(model: nn.Module, amount: float, exclude_patterns: tuple[str, ...]) -> dict[str, float]:
+    if amount <= 0.0:
+        return {}
+    if amount >= 1.0:
+        raise ValueError(f"PRUNE_AMOUNT must be in [0.0, 1.0), got {amount}")
+    stats: dict[str, float] = {}
+    for name, p in model.named_parameters():
+        if p.ndim < 2 or _name_excluded(name, exclude_patterns):
+            continue
+        flat = p.detach().abs().reshape(-1)
+        if flat.numel() == 0:
+            continue
+        k = int(amount * flat.numel())
+        if k <= 0:
+            stats[name] = 0.0
+            continue
+        threshold = torch.kthvalue(flat, k).values
+        mask = p.detach().abs() > threshold
+        p.mul_(mask)
+        stats[name] = 1.0 - float(mask.float().mean().item())
+    return stats
+
+
+@torch.no_grad()
+def fake_quantize_model_int8_inplace(model: nn.Module, exclude_patterns: tuple[str, ...]) -> None:
+    for name, p in model.named_parameters():
+        if not p.is_floating_point() or p.ndim < 2 or _name_excluded(name, exclude_patterns):
+            continue
+        q, s = quantize_float_tensor(p.detach().float().cpu())
+        if s.ndim > 0:
+            dq = q.float() * s.to(dtype=torch.float32).view(q.shape[0], *([1] * (q.ndim - 1)))
+        else:
+            dq = q.float() * float(s.item())
+        p.copy_(dq.to(device=p.device, dtype=p.dtype))
+
+
+def model_global_sparsity(model: nn.Module) -> tuple[int, int, float]:
+    total = 0
+    nonzero = 0
+    with torch.no_grad():
+        for p in model.parameters():
+            total += int(p.numel())
+            nonzero += int((p != 0).sum().item())
+    sparsity = 1.0 - (nonzero / total if total else 0.0)
+    return nonzero, total, sparsity
 
 
 # -----------------------------
@@ -907,6 +978,15 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    prune_start_step = args.prune_start_step if args.prune_start_step > 0 else max(1, args.iterations // 2)
+    prune_end_step = args.prune_end_step if args.prune_end_step > 0 else args.iterations
+    qat_int8_start_step = args.qat_int8_start_step if args.qat_int8_start_step > 0 else max(1, args.iterations // 2)
+    log0(
+        f"compression_knobs: prune_amount:{args.prune_amount} prune_progressive:{args.prune_progressive} "
+        f"prune_start:{prune_start_step} prune_end:{prune_end_step} prune_every:{args.prune_every} "
+        f"qat_int8_enabled:{args.qat_int8_enabled} qat_int8_start:{qat_int8_start_step} "
+        f"qat_int8_every:{args.qat_int8_every}"
+    )
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -966,6 +1046,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    applied_prune_target = 0.0
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1031,6 +1112,29 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+
+        next_step = step + 1
+        if args.prune_amount > 0.0:
+            if args.prune_progressive:
+                if next_step >= prune_start_step and next_step % max(args.prune_every, 1) == 0:
+                    span = max(1, prune_end_step - prune_start_step + 1)
+                    rel_step = min(span, next_step - prune_start_step + 1)
+                    target = args.prune_amount * (rel_step / span)
+                    if target > applied_prune_target:
+                        delta = max(0.0, min(0.95, target - applied_prune_target))
+                        if delta > 0:
+                            magnitude_prune_model_inplace(base_model, delta, args.prune_exclude)
+                            applied_prune_target = target
+            elif next_step == args.iterations:
+                magnitude_prune_model_inplace(base_model, args.prune_amount, args.prune_exclude)
+
+        if (
+            args.qat_int8_enabled
+            and next_step >= qat_int8_start_step
+            and next_step % max(args.qat_int8_every, 1) == 0
+        ):
+            fake_quantize_model_int8_inplace(base_model, args.qat_int8_exclude)
+
         zero_grad_all()
 
         step += 1
@@ -1058,6 +1162,8 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+    nonzero, total, sparsity = model_global_sparsity(base_model)
+    log0(f"model_sparsity: nonzero:{nonzero} total:{total} global_sparsity:{sparsity:.6f}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
