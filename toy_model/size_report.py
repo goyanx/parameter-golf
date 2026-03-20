@@ -34,6 +34,7 @@ def estimate_model_bytes(
     quant_group_size: int = 64,
     quant_exclude_patterns: tuple[str, ...] = ("token_emb", "head", "ln", "norm"),
     quant_fallback_dtype: str = "fp16",
+    quant_pack_order: str = "state_dict",
 ) -> int:
     payload = model_payload_bytes(
         model,
@@ -41,6 +42,7 @@ def estimate_model_bytes(
         quant_group_size=quant_group_size,
         quant_exclude_patterns=quant_exclude_patterns,
         quant_fallback_dtype=quant_fallback_dtype,
+        quant_pack_order=quant_pack_order,
     )
     return len(payload)
 
@@ -51,6 +53,7 @@ def model_payload_bytes(
     quant_group_size: int = 64,
     quant_exclude_patterns: tuple[str, ...] = ("token_emb", "head", "ln", "norm"),
     quant_fallback_dtype: str = "fp16",
+    quant_pack_order: str = "state_dict",
 ) -> bytes:
     if quant_bits is None:
         return _payload_from_state_dict(model.state_dict())
@@ -59,6 +62,7 @@ def model_payload_bytes(
         group_size=quant_group_size,
         exclude_patterns=quant_exclude_patterns,
         fallback_dtype=quant_fallback_dtype,
+        pack_order=quant_pack_order,
     )
     return _payload_from_quantized_state(model, quant_cfg=qcfg)
 
@@ -70,6 +74,7 @@ def estimate_artifact_bytes(
     quant_group_size: int = 64,
     quant_exclude_patterns: tuple[str, ...] = ("token_emb", "head", "ln", "norm"),
     quant_fallback_dtype: str = "fp16",
+    quant_pack_order: str = "state_dict",
     include_files: list[str] | None = None,
 ) -> int:
     code_dir = Path(code_dir)
@@ -95,6 +100,7 @@ def estimate_artifact_bytes(
                 quant_group_size=quant_group_size,
                 quant_exclude_patterns=quant_exclude_patterns,
                 quant_fallback_dtype=quant_fallback_dtype,
+                quant_pack_order=quant_pack_order,
             )
             zf.writestr("model_payload.bin", model_payload)
             zf.writestr("model_size_bytes.json", json.dumps({"model_bytes": len(model_payload)}))

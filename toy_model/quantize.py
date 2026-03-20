@@ -23,6 +23,7 @@ class QuantConfig:
     group_size: int = 64
     exclude_patterns: tuple[str, ...] = ("token_emb", "head", "ln", "norm")
     fallback_dtype: str = "fp16"
+    pack_order: str = "state_dict"
 
 
 def _quant_bounds(bits: int) -> Tuple[int, int]:
@@ -185,7 +186,15 @@ def fake_quantize_model_inplace(
 
 def quantized_payload_bytes(model: nn.Module, cfg: QuantConfig) -> bytes:
     chunks = []
-    for name, p in model.state_dict().items():
+    items = list(model.state_dict().items())
+    if cfg.pack_order == "name":
+        items = sorted(items, key=lambda kv: kv[0])
+    elif cfg.pack_order == "size_desc":
+        items = sorted(items, key=lambda kv: (-kv[1].numel(), kv[0]))
+    elif cfg.pack_order != "state_dict":
+        raise ValueError("pack_order must be 'state_dict', 'name', or 'size_desc'")
+
+    for name, p in items:
         if not torch.is_floating_point(p):
             continue
         t = p.detach().cpu()

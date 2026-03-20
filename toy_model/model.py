@@ -14,6 +14,7 @@ class ModelConfig:
     vocab_size: int
     d_model: int = 128
     n_heads: int = 4
+    attn_kv_heads: int | None = None
     n_layers: int = 2
     max_seq_len: int = 128
     dropout: float = 0.0
@@ -21,26 +22,40 @@ class ModelConfig:
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+    def __init__(self, d_model: int, n_heads: int, dropout: float, kv_heads: int | None = None) -> None:
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        self.kv_heads = n_heads if kv_heads is None else kv_heads
+        if self.kv_heads <= 0 or self.kv_heads > n_heads:
+            raise ValueError("attn_kv_heads must be in [1, n_heads]")
+        if n_heads % self.kv_heads != 0:
+            raise ValueError("n_heads must be divisible by attn_kv_heads")
+        self.head_group_size = n_heads // self.kv_heads
 
-        self.qkv = nn.Linear(d_model, 3 * d_model)
+        kv_width = self.kv_heads * self.head_dim
+        self.qkv = nn.Linear(d_model, d_model + 2 * kv_width)
         self.proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         b, t, c = x.shape
         qkv = self.qkv(x)
-        q, k, v = qkv.split(self.d_model, dim=-1)
+        kv_width = self.kv_heads * self.head_dim
+        q = qkv[..., : self.d_model]
+        k = qkv[..., self.d_model : self.d_model + kv_width]
+        v = qkv[..., self.d_model + kv_width :]
 
         q = q.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(b, t, self.kv_heads, self.head_dim).transpose(1, 2)
+        v = v.view(b, t, self.kv_heads, self.head_dim).transpose(1, 2)
+
+        if self.kv_heads != self.n_heads:
+            k = k.repeat_interleave(self.head_group_size, dim=1)
+            v = v.repeat_interleave(self.head_group_size, dim=1)
 
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         att = att.masked_fill(attn_mask == 0, float("-inf"))
@@ -68,10 +83,10 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+    def __init__(self, d_model: int, n_heads: int, dropout: float, attn_kv_heads: int | None = None) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
+        self.attn = CausalSelfAttention(d_model, n_heads, dropout, kv_heads=attn_kv_heads)
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = MLP(d_model, dropout)
 
@@ -90,11 +105,14 @@ class TinyTransformerLM(nn.Module):
         self.drop = nn.Dropout(cfg.dropout)
 
         if cfg.weight_sharing:
-            self.shared_block = TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout)
+            self.shared_block = TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout, attn_kv_heads=cfg.attn_kv_heads)
             self.blocks = None
         else:
             self.blocks = nn.ModuleList(
-                [TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout) for _ in range(cfg.n_layers)]
+                [
+                    TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout, attn_kv_heads=cfg.attn_kv_heads)
+                    for _ in range(cfg.n_layers)
+                ]
             )
             self.shared_block = None
 

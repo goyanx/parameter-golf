@@ -27,6 +27,64 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+
+def _apply_compression_preset() -> str:
+    preset = os.environ.get("COMPRESSION_PRESET", "").strip().lower()
+    if not preset:
+        return ""
+
+    presets = {
+        # Portable sparse/compressed recipe from the toy search.
+        # This keeps the existing schedule defaults and only flips the
+        # compression switches that map cleanly onto train_gpt.py.
+        "toy_micro_best": {
+            "PRUNE_AMOUNT": "0.11",
+            "PRUNE_PROGRESSIVE": "1",
+            "PRUNE_EVERY": "25",
+            "QAT_INT8_ENABLED": "1",
+            "QAT_INT8_EVERY": "1",
+        },
+        "toy_tight": {
+            "PRUNE_AMOUNT": "0.11",
+            "PRUNE_PROGRESSIVE": "1",
+            "PRUNE_EVERY": "25",
+            "QAT_INT8_ENABLED": "1",
+            "QAT_INT8_EVERY": "1",
+        },
+    }
+    if preset not in presets:
+        raise ValueError(f"Unknown COMPRESSION_PRESET={preset!r}")
+    for key, value in presets[preset].items():
+        os.environ.setdefault(key, value)
+    return preset
+
+
+def _apply_experiment_preset() -> str:
+    preset = os.environ.get("EXPERIMENT_PRESET", "").strip().lower()
+    if not preset:
+        return ""
+
+    presets = {
+        # Leaderboard-shaped architecture with the toy-compression recipe.
+        # This keeps the run close to the public winning pattern: deeper model,
+        # tied embeddings, modest KV sharing, and the existing compression stack.
+        "runpod_combo_10l": {
+            "NUM_LAYERS": "10",
+            "NUM_KV_HEADS": "4",
+            "TIE_EMBEDDINGS": "1",
+            "COMPRESSION_PRESET": "toy_tight",
+        },
+    }
+    if preset not in presets:
+        raise ValueError(f"Unknown EXPERIMENT_PRESET={preset!r}")
+    for key, value in presets[preset].items():
+        os.environ.setdefault(key, value)
+    return preset
+
+
+EXPERIMENT_PRESET = _apply_experiment_preset()
+COMPRESSION_PRESET = _apply_compression_preset()
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -86,6 +144,8 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     # Optional stabilization/compression knobs (off by default).
+    experiment_preset = os.environ.get("EXPERIMENT_PRESET", "").strip()
+    compression_preset = os.environ.get("COMPRESSION_PRESET", "").strip()
     prune_amount = float(os.environ.get("PRUNE_AMOUNT", 0.0))
     prune_progressive = bool(int(os.environ.get("PRUNE_PROGRESSIVE", "0")))
     prune_start_step = int(os.environ.get("PRUNE_START_STEP", -1))
@@ -985,7 +1045,8 @@ def main() -> None:
         f"compression_knobs: prune_amount:{args.prune_amount} prune_progressive:{args.prune_progressive} "
         f"prune_start:{prune_start_step} prune_end:{prune_end_step} prune_every:{args.prune_every} "
         f"qat_int8_enabled:{args.qat_int8_enabled} qat_int8_start:{qat_int8_start_step} "
-        f"qat_int8_every:{args.qat_int8_every}"
+        f"qat_int8_every:{args.qat_int8_every} experiment_preset:{args.experiment_preset or 'none'} "
+        f"compression_preset:{args.compression_preset or 'none'}"
     )
     log0(f"seed:{args.seed}")
 

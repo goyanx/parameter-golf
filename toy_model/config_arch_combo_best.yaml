@@ -1,0 +1,72 @@
+data:
+  text_file: data/tiny_corpus.txt
+  val_frac: 0.1
+
+model:
+  vocab_size: 256
+  d_model: 128
+  n_heads: 4
+  attn_kv_heads: 2
+  n_layers: 2
+  max_seq_len: 64
+  dropout: 0.0
+  weight_sharing: true
+
+train:
+  seed: 1337
+  use_cuda: true
+  lr: 0.001
+  batch_size: 16
+  steps: 200
+  eval_every: 50
+  eval_steps: 8
+  grad_clip: 0.8
+
+quantize:
+  bits: 4
+  group_size: 40
+  pack_order: size_desc
+  exclude_patterns:
+    - token_emb
+    - head
+    - ln
+    - norm
+  fallback_dtype: fp16
+
+prune:
+  amount: 0.08
+  mode: row
+  include_patterns:
+    - attn
+  progressive: true
+  start_step: 100
+  end_step: 200
+  every: 25
+
+lowrank:
+  rank: 56
+
+qat:
+  enabled: true
+  steps: 90
+  lr: 0.0002
+  grad_clip: 0.8
+  delay_fake_quant_steps: 20
+
+distill:
+  enabled: true
+  alpha: 0.35
+  alpha_start: 0.5
+  alpha_end: 0.25
+  alpha_schedule: linear
+  temperature: 2.2
+  teacher_steps: 240
+  teacher_lr: 0.001
+  teacher_model:
+    d_model: 256
+    n_heads: 8
+    n_layers: 4
+    max_seq_len: 64
+    dropout: 0.0
+    weight_sharing: false
+    vocab_size: 256

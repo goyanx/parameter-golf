@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ import yaml
 
 from lowrank import maybe_replace_linear
 from model import ModelConfig, TinyTransformerLM
-from prune import global_sparsity, magnitude_prune_model
+from prune import global_sparsity, magnitude_prune_model, structured_prune_model
 from quantize import fake_quantize_model_inplace
 from size_report import bytes_to_mb, estimate_artifact_bytes, parameter_count
 from tokenizer import load_text, train_val_tokens
@@ -54,15 +55,22 @@ def build_model(cfg: Dict) -> TinyTransformerLM:
         vocab_size=cfg["model"]["vocab_size"],
         d_model=cfg["model"]["d_model"],
         n_heads=cfg["model"]["n_heads"],
+        attn_kv_heads=cfg["model"].get("attn_kv_heads"),
         n_layers=cfg["model"]["n_layers"],
         max_seq_len=cfg["model"]["max_seq_len"],
         dropout=cfg["model"].get("dropout", 0.0),
         weight_sharing=cfg["model"].get("weight_sharing", False),
     )
     model = TinyTransformerLM(model_cfg)
-    rank = cfg.get("lowrank", {}).get("rank")
+    lowrank_cfg = cfg.get("lowrank", {})
+    rank = lowrank_cfg.get("rank")
     if rank is not None:
-        model = maybe_replace_linear(model, rank=rank)
+        model = maybe_replace_linear(
+            model,
+            rank=rank,
+            include_patterns=_to_patterns(lowrank_cfg.get("include_patterns", [])),
+            exclude_patterns=_to_patterns(lowrank_cfg.get("exclude_patterns", [])),
+        )
     return model
 
 
@@ -144,6 +152,7 @@ def main() -> None:
     quant_group_size = int(cfg.get("quantize", {}).get("group_size", 64))
     quant_exclude_patterns = _to_patterns(cfg.get("quantize", {}).get("exclude_patterns", []))
     quant_fallback_dtype = str(cfg.get("quantize", {}).get("fallback_dtype", "fp16"))
+    quant_pack_order = str(cfg.get("quantize", {}).get("pack_order", "state_dict"))
     distill_cfg = cfg.get("distill", {})
     distill_enabled = bool(distill_cfg.get("enabled", False))
     distill_alpha = float(distill_cfg.get("alpha", 0.5))
@@ -156,6 +165,9 @@ def main() -> None:
 
     prune_cfg = cfg.get("prune", {})
     prune_amount = float(prune_cfg.get("amount", 0.0))
+    prune_mode = str(prune_cfg.get("mode", "magnitude")).lower()
+    prune_include_patterns = _to_patterns(prune_cfg.get("include_patterns", []))
+    prune_exclude_patterns = _to_patterns(prune_cfg.get("exclude_patterns", []))
     progressive_prune_enabled = bool(prune_cfg.get("progressive", False))
     progressive_prune_start = int(prune_cfg.get("start_step", max(1, steps // 2)))
     progressive_prune_end = int(prune_cfg.get("end_step", steps))
@@ -216,7 +228,16 @@ def main() -> None:
                     # Apply only the incremental amount to avoid repeated over-pruning.
                     delta = max(0.0, min(0.95, target - applied_prune_target))
                     if delta > 0:
-                        magnitude_prune_model(model, amount=delta)
+                        if prune_mode == "magnitude":
+                            magnitude_prune_model(model, amount=delta)
+                        else:
+                            structured_prune_model(
+                                model,
+                                amount=delta,
+                                mode=prune_mode,
+                                include_patterns=prune_include_patterns,
+                                exclude_patterns=prune_exclude_patterns,
+                            )
                         applied_prune_target = target
 
         if eval_every > 0 and step % eval_every == 0:
@@ -225,10 +246,31 @@ def main() -> None:
 
     prune_stats = {}
     if prune_amount > 0 and not progressive_prune_enabled:
-        prune_stats = magnitude_prune_model(model, amount=prune_amount)
+        if prune_mode == "magnitude":
+            prune_stats = magnitude_prune_model(model, amount=prune_amount)
+        else:
+            prune_stats = structured_prune_model(
+                model,
+                amount=prune_amount,
+                mode=prune_mode,
+                include_patterns=prune_include_patterns,
+                exclude_patterns=prune_exclude_patterns,
+            )
     elif prune_amount > 0 and progressive_prune_enabled:
         # Collect layer stats with a no-op prune call.
-        prune_stats = {k: v for k, v in magnitude_prune_model(model, amount=0.0).items()}
+        if prune_mode == "magnitude":
+            prune_stats = {k: v for k, v in magnitude_prune_model(model, amount=0.0).items()}
+        else:
+            prune_stats = {
+                k: v
+                for k, v in structured_prune_model(
+                    model,
+                    amount=0.0,
+                    mode=prune_mode,
+                    include_patterns=prune_include_patterns,
+                    exclude_patterns=prune_exclude_patterns,
+                ).items()
+            }
 
     qat_cfg = cfg.get("qat", {})
     qat_enabled = bool(qat_cfg.get("enabled", False))
@@ -264,9 +306,14 @@ def main() -> None:
         quant_group_size=quant_group_size,
         quant_exclude_patterns=quant_exclude_patterns or ("token_emb", "head", "ln", "norm"),
         quant_fallback_dtype=quant_fallback_dtype,
+        quant_pack_order=quant_pack_order,
     )
     params = parameter_count(model)
     nonzero, total, sparsity = global_sparsity(model)
+
+    if bool(int(os.environ.get("SAVE_MODEL_STATE", "0"))):
+        save_path = Path(os.environ.get("SAVE_MODEL_STATE_PATH", str(root / "final_model.pt")))
+        torch.save(model.state_dict(), save_path)
 
     if artifact_bytes > ARTIFACT_LIMIT_BYTES:
         raise RuntimeError(
@@ -284,9 +331,13 @@ def main() -> None:
         "train_time_sec": train_time,
         "val_loss": val_loss,
         "prune_layers": len(prune_stats),
+        "prune_mode": prune_mode,
+        "prune_include_patterns": list(prune_include_patterns),
+        "prune_exclude_patterns": list(prune_exclude_patterns),
         "quant_bits": quant_bits,
         "quant_group_size": quant_group_size,
         "quant_exclude_patterns": list(quant_exclude_patterns),
+        "quant_pack_order": quant_pack_order,
         "distill_enabled": distill_enabled,
         "distill_alpha": distill_alpha,
         "distill_alpha_start": distill_alpha_start,

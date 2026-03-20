@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Iterable
 
 import torch
 import torch.nn as nn
@@ -33,10 +34,25 @@ class LowRankLinear(nn.Module):
         return torch.nn.functional.linear(x, w, self.bias)
 
 
-def maybe_replace_linear(module: nn.Module, rank: int | None = None) -> nn.Module:
+def _matches_any(name: str, patterns: Iterable[str]) -> bool:
+    n = name.lower()
+    return any(p.lower() in n for p in patterns)
+
+
+def maybe_replace_linear(
+    module: nn.Module,
+    rank: int | None = None,
+    include_patterns: tuple[str, ...] = (),
+    exclude_patterns: tuple[str, ...] = (),
+    _prefix: str = "",
+) -> nn.Module:
     if rank is None:
         return module
     if isinstance(module, nn.Linear):
+        if exclude_patterns and _matches_any(_prefix, exclude_patterns):
+            return module
+        if include_patterns and not _matches_any(_prefix, include_patterns):
+            return module
         return LowRankLinear(
             in_features=module.in_features,
             out_features=module.out_features,
@@ -44,6 +60,16 @@ def maybe_replace_linear(module: nn.Module, rank: int | None = None) -> nn.Modul
             bias=module.bias is not None,
         )
     for name, child in list(module.named_children()):
-        setattr(module, name, maybe_replace_linear(child, rank=rank))
+        child_prefix = f"{_prefix}.{name}" if _prefix else name
+        setattr(
+            module,
+            name,
+            maybe_replace_linear(
+                child,
+                rank=rank,
+                include_patterns=include_patterns,
+                exclude_patterns=exclude_patterns,
+                _prefix=child_prefix,
+            ),
+        )
     return module
-

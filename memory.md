@@ -308,3 +308,248 @@ Validation:
 
 Next:
 - Run a short real-data smoke run with `QAT_INT8_ENABLED=1` and `PRUNE_PROGRESSIVE=1` to calibrate wall-clock and val_bpb impact.
+
+## 2026-03-20 - Three-path toy research sweep
+
+Context:
+- Wanted to test the Marie Kondo framing as concrete toy-model research paths rather than a single vague compression bucket.
+
+Changes:
+- Files changed: `toy_model/prune.py`, `toy_model/lowrank.py`, `toy_model/train.py`, `toy_model/run_research_paths.py`, `toy_model/config_structured_best.yaml`, `toy_model/README.md`.
+- Config knobs:
+  - `prune.mode in {magnitude,row,col}`
+  - `prune.include_patterns`
+  - `lowrank.include_patterns`
+  - `lowrank.exclude_patterns`
+
+Results:
+- Structured sparsity path:
+  - Best: `struct_row_attn_010`
+  - artifact_size_mb: 0.15899658203125
+  - val_loss: 2.56418770551682
+- Selective precision path:
+  - Best loss-focused run: `prec_keep_attn_mlp_fp16`
+  - artifact_size_mb: 0.304649353027344
+  - val_loss: 2.54905834794044
+- Selective low-rank path:
+  - Best loss-focused run: `lr_attn_56`
+  - artifact_size_mb: 0.234420776367188
+  - val_loss: 2.00412733852863
+
+Decision:
+- Keep structured sparsity as the most promising frontier-preserving idea.
+- Keep selective precision and selective low-rank as quality probes, but they are not size-efficient in the current toy setup.
+
+Learnings:
+- Row pruning on attention blocks improved loss slightly without materially changing size.
+- Extra precision buys quality quickly, but at a large artifact-size cost.
+- Selective low-rank on attention layers greatly improved loss, but the size penalty was too large for the current goal.
+
+Next:
+- Use `config_structured_best.yaml` as the next compact candidate.
+- Keep low-rank and selective precision only as secondary comparison paths unless size math changes.
+
+## 2026-03-20 - Structured sparsity tightened and plateaued
+
+Context:
+- Wanted to see whether attention-row pruning could move the compact frontier after the three-path sweep.
+
+Changes:
+- Files changed: `toy_model/run_structured_tight.py`, `toy_model/EXPERIMENT_TRACKER.md`, `toy_model/config_structured_best.yaml`.
+- Config knobs:
+  - `prune.amount in {0.06,0.08,0.10,0.12,0.14}`
+  - `prune.mode=row`
+  - `prune.include_patterns=["attn"]`
+
+Results:
+- Best loss:
+  - `struct_tight_03`
+  - artifact_size_mb: 0.15916728973388672
+  - val_loss: 2.564187705516815
+- Best size:
+  - `struct_tight_01`
+  - artifact_size_mb: 0.15910911560058594
+  - val_loss: 2.5748329758644104
+
+Decision:
+- Stop pushing structured row pruning.
+
+Learnings:
+- Pruning amount changes barely moved artifact size.
+- The gain over the micro-best frontier was marginal and not worth more search budget.
+
+Next:
+- Move to a different compression axis if we continue toy-model work.
+
+## 2026-03-20 - Layer-wise precision ranking plateau
+
+Context:
+- Tested whether keeping only the most sensitive tensors/modules in higher precision would improve the compact frontier.
+
+Changes:
+- Files changed: `toy_model/train.py`, `toy_model/run_precision_ranked.py`.
+- Config knobs:
+  - baseline from `config_micro_best.yaml`
+  - precision keep sets derived from sensitivity ranking
+  - `quantize.exclude_patterns` expanded per ranked keep set
+
+Results:
+- Baseline compact run:
+  - artifact_size_mb: 0.1597
+  - val_loss: 2.5763
+- Best single-module sensitivity keep:
+  - `pos_emb`
+  - artifact_size_mb: 0.1670
+  - val_loss: 2.5742
+- Best two-module keep:
+  - `pos_emb + shared_block.attn.qkv`
+  - artifact_size_mb: 0.2061
+  - val_loss: 2.5510
+
+Decision:
+- Stop this branch.
+
+Learnings:
+- The most sensitive tensors were small enough that protecting them did not move the frontier in a useful way.
+- Precision allocation improved loss only by spending too many extra bytes.
+
+Next:
+- Try a different compression axis rather than more precision slicing.
+
+## 2026-03-20 - Breadth sweep across pruning, low-rank, and packing
+
+Context:
+- Ran the next broad pass to cover the most promising remaining compression axes in parallel.
+
+Changes:
+- Files changed: `toy_model/quantize.py`, `toy_model/size_report.py`, `toy_model/train.py`, `toy_model/run_breadth_sweep.py`.
+- Config knobs:
+  - `prune.mode in {row,col}`
+  - `prune.include_patterns=["attn"]` or `["attn","mlp"]`
+  - `lowrank.include_patterns=["attn"]`, `["mlp"]`, or both
+  - `quantize.pack_order in {state_dict,name,size_desc}`
+
+Results:
+- Best structured run:
+  - `block_row_attn_010`
+  - artifact_size_mb: 0.1594371795654297
+  - val_loss: 2.564187705516815
+- Best packing run:
+  - `pack_size_desc`
+  - artifact_size_mb: 0.1594085693359375
+  - val_loss: 2.57634699344635
+- Best low-rank run:
+  - `lr_attn_48`
+  - artifact_size_mb: 0.2318716049194336
+  - val_loss: 1.9322985410690308
+
+Decision:
+- Keep structured row pruning as the only meaningful frontier-preserving branch from this sweep.
+- Treat pack-order tuning as a tiny byte optimization.
+- Stop low-rank as a size-efficient direction for now.
+
+Learnings:
+- Broadening pruning from attention-only to attention+MLP did not improve the frontier.
+- Low-rank on attention remains quality-heavy and size-expensive.
+- Sorting packed tensors by size is a real but very small artifact-size improvement.
+
+Next:
+- If we continue toy-model work, combine the best structured recipe with `quantize.pack_order=size_desc`.
+
+## 2026-03-20 - Structured pack-order compare
+
+Context:
+- Re-ran the best structured pruning recipe with different packing orders to see whether serialization layout can beat the current structured frontier.
+
+Changes:
+- Files changed: `toy_model/run_pack_compare.py`.
+- Config knobs:
+  - `quantize.pack_order in {state_dict,name,size_desc}`
+
+Results:
+- `pack_state_dict_struct`:
+  - artifact_size_mb: 0.1595
+  - val_loss: 2.5642
+- `pack_name_struct`:
+  - artifact_size_mb: 0.1596
+  - val_loss: 2.5642
+- `pack_size_desc_struct`:
+  - artifact_size_mb: 0.1591
+  - val_loss: 2.5642
+
+Decision:
+- Keep `size_desc` as the best packing order.
+- Do not treat packing order as a standalone frontier mover.
+
+Learnings:
+- Sorting by descending tensor size is consistently the best of the three tested pack orders.
+- The improvement is small relative to the structured-pruning effect itself.
+
+Next:
+- If we keep iterating, combine structured pruning with `size_desc` packing rather than searching packing alone.
+
+## 2026-03-20 - Grouped-query attention architecture sweep
+
+Context:
+- Tested the smallest architecture change that could plausibly help without turning the toy model into a new codebase.
+
+Changes:
+- Files changed: `toy_model/model.py`, `toy_model/train.py`, `toy_model/run_arch_sweep.py`, `toy_model/config_gqa_best.yaml`, `toy_model/README.md`.
+- Config knobs:
+  - `model.attn_kv_heads in {1,2,4}`
+
+Results:
+- `attn_kv_heads=4` baseline:
+  - artifact_size_mb: 0.1604
+  - val_loss: 2.6503
+- `attn_kv_heads=2`:
+  - artifact_size_mb: 0.1583
+  - val_loss: 2.6084
+- `attn_kv_heads=1`:
+  - artifact_size_mb: 0.1556
+  - val_loss: 2.6173
+
+Decision:
+- Keep `attn_kv_heads=2` as the best architecture candidate.
+
+Learnings:
+- Grouped-query attention helped size without the quality penalty you’d expect from a blunt head reduction.
+- `kv_heads=1` was too aggressive for this toy setup.
+
+Next:
+- If we keep going, combine `attn_kv_heads=2` with the best structured pruning recipe and stop if the gain is marginal.
+
+## 2026-03-20 - Architecture plus compression combo
+
+Context:
+- Combined the best architecture knob from the GQA sweep with the best structured pruning recipe.
+
+Changes:
+- Files changed: `toy_model/run_arch_combo.py`, `toy_model/config_arch_combo_best.yaml`, `toy_model/README.md`.
+- Config knobs:
+  - `model.attn_kv_heads=2`
+  - `prune.mode=row`
+  - `prune.include_patterns=["attn"]`
+  - `prune.amount in {0.08,0.10,0.12}`
+  - `quantize.pack_order=size_desc`
+
+Results:
+- `prune.amount=0.08`:
+  - artifact_size_mb: 0.15744781494140625
+  - val_loss: 2.6036025881767273
+- `prune.amount=0.10`:
+  - artifact_size_mb: 0.15835094451904297
+  - val_loss: 2.608449548482895
+- `prune.amount=0.12`:
+  - artifact_size_mb: 0.1588296890258789
+  - val_loss: 2.6158049404621124
+
+Decision:
+- Keep `prune.amount=0.08` as the current combined arch+compression candidate.
+
+Learnings:
+- The GQA gain survives when paired with structured pruning.
+- More pruning past 0.08 just erodes quality faster than it saves bytes.
+
+Next:
+- Stop broad architecture search here unless the leaderboard context suggests a specific new knob worth testing.

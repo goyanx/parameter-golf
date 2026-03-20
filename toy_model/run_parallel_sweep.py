@@ -40,7 +40,11 @@ def run_one(root: Path, python_exe: str, name: str, cfg: dict) -> dict:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--max-workers", type=int, default=2)
-    p.add_argument("--mode", choices=["light", "mixed", "chassis", "frontier", "full"], default="light")
+    p.add_argument(
+        "--mode",
+        choices=["light", "mixed", "chassis", "frontier", "micro", "refine", "tight", "full"],
+        default="light",
+    )
     return p.parse_args()
 
 
@@ -85,6 +89,36 @@ def build_cases(base_cfg: dict, mode: str) -> list[tuple[str, dict]]:
         group_size_vals = [32, 48]
         delay_fake_quant_vals = [20]
         temp_vals = [2.0, 2.5]
+    elif mode == "micro":
+        # Fine-tune near compact frontier.
+        prune_vals = [0.11, 0.12]
+        qat_steps_vals = [90]
+        alpha_vals = [0.35]
+        teacher_steps_vals = [220]
+        lowrank_vals = [56]
+        group_size_vals = [48]
+        delay_fake_quant_vals = [20]
+        temp_vals = [2.2, 2.3, 2.4]
+    elif mode == "refine":
+        # Narrow probe around the current compact frontier.
+        prune_vals = [0.11, 0.12]
+        qat_steps_vals = [90]
+        alpha_vals = [0.35]
+        teacher_steps_vals = [220, 240]
+        lowrank_vals = [56]
+        group_size_vals = [40, 48]
+        delay_fake_quant_vals = [20]
+        temp_vals = [2.2, 2.3, 2.4]
+    elif mode == "tight":
+        # Final squeeze around the current best compact point.
+        prune_vals = [0.10, 0.11]
+        qat_steps_vals = [90]
+        alpha_vals = [0.35]
+        teacher_steps_vals = [240, 260]
+        lowrank_vals = [56]
+        group_size_vals = [40]
+        delay_fake_quant_vals = [20]
+        temp_vals = [2.2, 2.3, 2.4]
     else:
         prune_vals = [0.05, 0.10, 0.15]
         qat_steps_vals = [60, 90]
