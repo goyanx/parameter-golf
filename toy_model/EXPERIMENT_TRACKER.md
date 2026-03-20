@@ -64,18 +64,60 @@
   - Combined `attn_kv_heads=2` with attention-row pruning and `size_desc` packing
   - Best run: `prune.amount=0.08`, `artifact_size_mb~0.1574`, `val_loss~2.6036`
   - This is the best architecture+compression candidate so far, but it still does not beat the structured-pruning best on loss
+- Toy-focus sweep (`run_parallel_sweep.py --mode toyfocus --max-workers 2`):
+  - Re-tested grouped-query choices (`attn_kv_heads in {1,2,4}`) on top of the compact frontier recipe
+  - Best quality in sweep: `val_loss~2.5415` at `~0.1575 MB` (`attn_kv_heads=1`, `prune=0.12`)
+  - Notable compact probe: `~0.1517 MB` at `~2.90` loss (`attn_kv_heads=2`, `prune=0.12`)
+  - New locked config: `config_toyfocus_best.yaml`
+- Wanda probe (`run_wanda_probe.py`):
+  - Implemented `prune.mode=wanda` (`|w| * activation_norm`) with calibration batches
+  - Compared against magnitude on same toyfocus baseline
+  - Result: tiny size gain but worse loss, so current Wanda variant is dropped
+- AWQ-lite probe (`run_awq_lite_probe.py`):
+  - Implemented channel-level protected columns during quantization (`quantize.protect_frac`)
+  - Best quality delta was tiny (about `-0.0027` loss) but added about `+0.0083 MB`
+  - Decision: drop for compact frontier work
+- MLA probe (`run_mla_probe.py`):
+  - Implemented latent KV bottleneck (`model.attn_kv_latent_dim`)
+  - Size savings were tiny (`~0.0009-0.0026 MB`) while loss worsened (`~+0.20 to +0.54`)
+  - Decision: drop MLA bottleneck for current toy objective
+- Hidden-state distillation probe (`run_hidden_distill_probe.py`):
+  - Added TinyBERT-style hidden-state MSE loss on top of logits distillation
+  - `hidden_weight=0.05`: size `~0.1543 MB`, loss `~2.7142`
+  - `hidden_weight=0.10`: size `~0.1592 MB`, loss `~2.7436`
+  - Baseline logits-only: size `~0.1587 MB`, loss `~2.5415`
+  - Decision: drop hidden-state distillation for now
+- ALiBi positional probe (`run_alibi_probe.py`):
+  - Compared `model.positional_encoding=learned` vs `alibi` on toyfocus settings
+  - Learned: `~0.1592 MB`, loss `~2.5415`
+  - ALiBi: `~0.1563 MB`, loss `~2.3854`
+  - Delta (ALiBi vs learned): `-0.0029 MB`, `-0.1561` loss
+  - Decision: keep ALiBi and promote to `config_toyfocus_best.yaml`
+- Mixed-bit quantization probe (`run_mixedbit_probe.py`):
+  - Added per-layer bit overrides via `quantize.layer_bits`
+  - Most selective override sets were neutral vs baseline in this setup
+  - Baseline (ALiBi + int4): `~0.1572 MB`, loss `~2.3854`
+  - Best compact (`quantize.bits=3`): `~0.1445 MB`, loss `~2.3883`
+  - Delta vs int4 baseline: `-0.0127 MB`, `+0.0029` loss
+  - Decision: keep mixed-bit capability and add compact preset `config_toyfocus_mixedbit_compact.yaml`
+- RunPod real-pipeline reference (non-toy, `train_gpt.py`, 1xH100, 10-minute cap):
+  - stop step: `1133`
+  - final exact: `val_loss=2.27510323`, `val_bpb=1.34744428`
+  - compressed submission size: `12,881,371 bytes` (under 16MB)
+  - detailed record stored in top-level `memory.md`
 
 ## In Progress
 
-- Structured row pruning has plateaued; stop extending that branch.
-- Next useful work:
-  - compare `train_gpt.py` baseline vs `COMPRESSION_PRESET=toy_micro_best` on a short smoke run
-  - decide whether a different compression axis is worth a new toy sweep
-  - treat layer-wise precision allocation as plateaued unless a new tensor granularity appears
-  - consider combining the best structured-pruning recipe with `quantize.pack_order=size_desc`
-  - if we keep going, test structured-pruning plus `size_desc` packing against the current best structured config
-  - if architecture continues, keep `attn_kv_heads=2` and tighten only around that setting
-  - if combining architecture with compression, start from `config_arch_combo_best.yaml`
+- `toyfocus + ALiBi` is now the primary compact-quality branch (`~0.1563 MB / ~2.3854`).
+- `toyfocus + ALiBi + int3` is the compact-size branch (`~0.1445 MB / ~2.3883`).
+- No-go branches cleaned from active toy code:
+  - Wanda pruning path removed
+  - AWQ-lite channel protection removed
+  - MLA latent KV path removed
+- Current coding shortlist:
+  - compare `train_gpt.py` baseline vs `COMPRESSION_PRESET=toy_micro_best` on short smoke run
+  - keep toy exploration only for materially new mechanisms (not plateaued knobs)
+  - next research axes from shortlist: `#2` attention-map distillation or `#3` 2:4 structured sparsity
 
 ## Yet To Try
 
@@ -108,7 +150,9 @@
 ## Objective Check
 
 - Current best near-size:
-  - `~0.1587 MB`, loss `~2.576`
+  - `~0.1563 MB`, loss `~2.385`
+- Current best compact-size:
+  - `~0.1445 MB`, loss `~2.388`
 - Structured best:
   - `~0.1592 MB`, loss `~2.564`
 - Structured tight best size:

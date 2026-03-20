@@ -23,15 +23,19 @@ Progress tracker for local development and challenge readiness.
 - [x] Magnitude pruning implemented (`toy_model/prune.py`).
 - [x] Weight-sharing option implemented (`model.weight_sharing`).
 - [x] Low-rank replacement implemented (`toy_model/lowrank.py`).
+- [x] Remove no-go compression branches from active code (Wanda/AWQ-lite/MLA).
+- [x] Add and test hidden-state distillation probe (`run_hidden_distill_probe.py`).
+- [x] Add and test ALiBi positional encoding (`model.positional_encoding=alibi`).
+- [x] Add and test mixed-bit quantization (`quantize.layer_bits`, int3/int4 probe).
 - [x] Validate each feature with successful runs.
 - [x] Record per-feature tradeoffs in `memory.md`.
 
 ## Ablations
 
 - [x] Ablation runner exists (`toy_model/run_ablations.py`).
-- [ ] Run all ablations end-to-end.
-- [ ] Review `toy_model/runs/ablation_summary.json`.
-- [ ] Decide keep/drop for each technique.
+- [x] Run all ablations end-to-end.
+- [x] Review `toy_model/runs/ablation_summary.json`.
+- [x] Decide keep/drop for each technique.
 
 ## Scale-Up
 
@@ -50,5 +54,5 @@ Progress tracker for local development and challenge readiness.
 
 ## Ongoing Discipline
 
-- [ ] Append every meaningful experiment result to `memory.md`.
-- [ ] Keep `checklist.md` status updated after each session.
+- [x] Append every meaningful experiment result to `memory.md`.
+- [x] Keep `checklist.md` status updated after each session.

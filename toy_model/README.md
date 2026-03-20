@@ -20,7 +20,20 @@ toy_model/
   lowrank.py
   tokenizer.py
   size_report.py
+  run_parallel_sweep.py
   run_ablations.py
+  run_target_sweep.py
+  run_structured_tight.py
+  run_precision_ranked.py
+  run_breadth_sweep.py
+  run_pack_compare.py
+  run_arch_sweep.py
+  run_arch_combo.py
+  run_hidden_distill_probe.py
+  run_alibi_probe.py
+  run_mixedbit_probe.py
+  run_research_paths.py
+  EXPERIMENT_TRACKER.md
   data/tiny_corpus.txt
   runs/
 ```
@@ -47,6 +60,20 @@ Expected output includes:
 
 Metrics are written to `toy_model/runs/<run-name>.json`.
 
+## Current Best Toy Configs
+
+- Best compact-quality in recent toy sweeps:
+  - `toy_model/config_toyfocus_best.yaml`
+  - uses `model.positional_encoding=alibi`
+- Best compact-size variant with small quality tradeoff:
+  - `toy_model/config_toyfocus_mixedbit_compact.yaml`
+- Strong compact baseline:
+  - `toy_model/config_micro_best.yaml`
+- Frontier quality-oriented:
+  - `toy_model/config_frontier_quality.yaml`
+- Frontier compact-oriented:
+  - `toy_model/config_frontier_compact.yaml`
+
 ## Run Ablations
 
 ```powershell
@@ -62,6 +89,34 @@ This runs:
 - `lowrank32`
 
 Summary saved to `toy_model/runs/ablation_summary.json`.
+
+## Main Sweep Runner
+
+Use the parallel sweep runner for most iteration:
+
+```powershell
+python toy_model\run_parallel_sweep.py --max-workers 2 --mode <mode>
+```
+
+Supported modes:
+
+- `light`: quick starter sweep
+- `mixed`: mild structural compression + recovery
+- `chassis`: quant group-size + delayed fake quant sweep
+- `frontier`: broader last-mile sweep
+- `micro`: tight local sweep around compact frontier
+- `refine`: compact frontier refinement with group-size midpoint
+- `tight`: final squeeze around current best compact point
+- `toyfocus`: grouped-query architecture focus around compact settings
+- `full`: larger search (heavier)
+
+Primary output:
+
+- `toy_model/runs/parallel_sweep_summary.json`
+
+Per-run logs:
+
+- `toy_model/runs/logs/par_XX.log`
 
 ## Research Paths
 
@@ -126,6 +181,20 @@ This combines the best architecture knob with the best structured-pruning recipe
 
 Summary saved to `toy_model/runs/arch_combo_summary.json`.
 
+## Recommended Workflow (Toy-Only)
+
+1. Start from a locked config:
+   - `config_toyfocus_best.yaml` or `config_micro_best.yaml`
+2. Run one confirmation:
+   - `python toy_model\train.py --config toy_model\config_toyfocus_best.yaml --run-name confirm`
+3. Run a narrow 2-worker sweep:
+   - `python toy_model\run_parallel_sweep.py --max-workers 2 --mode toyfocus`
+4. Review summary:
+   - `toy_model/runs/parallel_sweep_summary.json`
+5. Log and decide:
+   - update `toy_model/EXPERIMENT_TRACKER.md`
+   - append key results to top-level `memory.md`
+
 ## Config Knobs
 
 - `quantize.bits`: `null` or integer in `[2..8]`
@@ -133,21 +202,61 @@ Summary saved to `toy_model/runs/arch_combo_summary.json`.
 - `quantize.exclude_patterns`: parameter-name substrings kept at fallback precision
 - `quantize.fallback_dtype`: `fp16` or `fp32` for excluded tensors
 - `quantize.pack_order`: `state_dict`, `name`, or `size_desc` ordering for payload packing
+- `quantize.layer_bits`: optional per-layer bit overrides, e.g. `{"attn.qkv": 3, "mlp.fc1": 5}`
 - `prune.amount`: fraction in `[0.0, 1.0)`
 - `prune.mode`: `magnitude`, `row`, or `col`
 - `prune.include_patterns`: optional substrings that restrict pruning to selected layers
 - `prune.exclude_patterns`: optional substrings that skip selected layers
 - `model.weight_sharing`: `true|false`
 - `model.attn_kv_heads`: grouped-query attention KV head count; defaults to `n_heads`
+- `model.positional_encoding`: `learned` or `alibi`
 - `lowrank.rank`: `null` or positive integer
 - `lowrank.include_patterns`: optional substrings that restrict low-rank replacement
 - `lowrank.exclude_patterns`: optional substrings that skip low-rank replacement
 - `qat.enabled|steps|lr`: short quantization-recovery finetune after main training
 - `distill.enabled|alpha|temperature`: enable teacher-student distillation
+- `distill.hidden_enabled|hidden_weight`: optional TinyBERT-style hidden-state distillation
 - `distill.teacher_steps|teacher_lr|teacher_model`: teacher training configuration
+
+### Hidden Distillation Probe
+
+```powershell
+python toy_model\run_hidden_distill_probe.py
+```
+
+Compares:
+
+- baseline logits distillation
+- logits + hidden-state distillation with small hidden-loss weights
+
+Summary saved to `toy_model/runs/hidden_distill_probe_summary.json`.
+
+### ALiBi Probe
+
+```powershell
+python toy_model\run_alibi_probe.py
+```
+
+Compares:
+
+- learned positional embeddings
+- ALiBi positional bias (`model.positional_encoding=alibi`)
+
+Summary saved to `toy_model/runs/alibi_probe_summary.json`.
+
+### Mixed-Bit Probe
+
+```powershell
+python toy_model\run_mixedbit_probe.py
+```
+
+Compares mixed-bit quantization variants on top of the ALiBi toyfocus baseline.
+
+Summary saved to `toy_model/runs/mixedbit_probe_summary.json`.
 
 ## Notes
 
 - This is a toy loop and not the official challenge training setup.
 - Artifact sizing uses compressed packaging of code files plus serialized model payload estimate.
 - `train.py` hard-fails if estimated artifact size exceeds `16 MB`.
+- Toy runs primarily track `val_loss`; official challenge ranking uses `val_bpb` in `train_gpt.py`.

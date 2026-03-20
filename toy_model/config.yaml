@@ -10,6 +10,7 @@ model:
   max_seq_len: 64
   dropout: 0.0
   weight_sharing: false
+  positional_encoding: learned
 
 train:
   seed: 1337
@@ -29,6 +30,8 @@ quantize:
     - ln
     - norm
   fallback_dtype: fp16
+  pack_order: state_dict
+  layer_bits: {}
 
 prune:
   amount: 0.0
@@ -45,6 +48,8 @@ distill:
   enabled: false
   alpha: 0.5
   temperature: 2.0
+  hidden_enabled: false
+  hidden_weight: 0.1
   teacher_steps: 0
   teacher_lr: 0.001
   teacher_model:

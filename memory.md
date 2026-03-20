@@ -309,6 +309,211 @@ Validation:
 Next:
 - Run a short real-data smoke run with `QAT_INT8_ENABLED=1` and `PRUNE_PROGRESSIVE=1` to calibrate wall-clock and val_bpb impact.
 
+## 2026-03-20 - Baseline ablations rerun and decisions logged
+
+Context:
+- Completed pending checklist ablation run to refresh keep/drop decisions with current code.
+
+Changes:
+- Executed `toy_model/run_ablations.py` end-to-end.
+- Reviewed `toy_model/runs/ablation_summary.json`.
+
+Results:
+- `baseline`: `artifact_size_mb~1.5572`, `val_loss~2.0207`
+- `quant4_qat`: `artifact_size_mb~0.3482`, `val_loss~2.0610`
+- `prune30`: `artifact_size_mb~1.2232`, `val_loss~2.3264`
+- `weight_share`: `artifact_size_mb~0.8586`, `val_loss~2.4389`
+- `lowrank32`: `artifact_size_mb~0.6481`, `val_loss~3.0505`
+
+Decision:
+- Keep: `quant4_qat` as the best baseline compression move.
+- Conditional: `weight_share` only if extra size pressure is needed.
+- Drop for now: `prune30`, `lowrank32` in isolation.
+
+Learnings:
+- QAT-quantized baseline preserves quality best among single-step compressions.
+- Naive low-rank and heavy pruning remain too lossy without stronger recovery.
+
+Next:
+- Highest-value coding items now:
+  1. Add a real-pipeline smoke comparator for `train_gpt.py` baseline vs `COMPRESSION_PRESET=toy_micro_best`.
+  2. Keep toy exploration focused on non-plateaued axes only (architecture + selective structured compression).
+
+## 2026-03-20 - Toy-only grouped-query focus sweep
+
+Context:
+- RunPod credits are unavailable, so focus shifted back to toy-only experimentation.
+- Tested grouped-query attention as a new non-plateaued axis on top of compact frontier settings.
+
+Changes:
+- `toy_model/run_parallel_sweep.py`: added `mode=toyfocus`.
+- Added `toy_model/config_toyfocus_best.yaml`.
+
+Results:
+- Best quality in sweep (`par_04`):
+  - artifact_size_mb: ~0.1575
+  - val_loss: ~2.5415
+  - `attn_kv_heads=1`, `prune.amount=0.12`
+- Compact edge case (`par_05`):
+  - artifact_size_mb: ~0.1517
+  - val_loss: ~2.9000
+  - `attn_kv_heads=2`, `prune.amount=0.12`
+
+Decision:
+- Keep `config_toyfocus_best.yaml` as the new toy quality/size winner.
+
+Learnings:
+- In this setup, `attn_kv_heads=1` unexpectedly improved the compact frontier relative to prior micro-best.
+- `attn_kv_heads=2` opens a promising path near ~0.152 MB if we can recover a small amount of loss.
+
+Next:
+- Tighten around the compact edge (`attn_kv_heads=2`, ~0.152 MB) to try crossing below `2.8` loss.
+
+## 2026-03-20 - Fresh parallel rerun (toyfocus vs micro)
+
+Context:
+- User requested rerunning parallel tests and reporting back.
+- Ran both sweeps with the same desktop-safe settings (`--max-workers 2`).
+
+Changes:
+- Commands executed:
+  - `python toy_model/run_parallel_sweep.py --max-workers 2 --mode micro`
+  - `python toy_model/run_parallel_sweep.py --max-workers 2 --mode toyfocus`
+- Saved snapshots:
+  - `toy_model/runs/parallel_sweep_micro_latest.json`
+  - `toy_model/runs/parallel_sweep_toyfocus_latest.json`
+
+Results:
+- Micro best:
+  - run: `par_01`
+  - artifact_size_mb: `0.161449`
+  - val_loss: `2.594066`
+- Toyfocus best:
+  - run: `par_04`
+  - artifact_size_mb: `0.158110`
+  - val_loss: `2.541510`
+- Toyfocus compact edge:
+  - `artifact_size_mb~0.1523`
+  - `val_loss~2.9000`
+
+Decision:
+- Keep `toyfocus` as the stronger current branch versus `micro`.
+
+Learnings:
+- Grouped-query tuning around the compact recipe is still the best quality/size tradeoff among these two sweep families.
+
+Next:
+- Tighten only around `toyfocus` (`attn_kv_heads=1/2`) with small prune/temp perturbations.
+
+## 2026-03-20 - Wanda pruning probe (paper idea #1)
+
+Context:
+- Implemented and tested Wanda-style pruning (`|w| * activation_norm`) against current magnitude baseline.
+
+Changes:
+- Files changed:
+  - `toy_model/prune.py`
+  - `toy_model/train.py`
+  - `toy_model/run_wanda_probe.py`
+- Added `prune.mode=wanda` and activation-calibration batches (`prune.wanda_calib_batches`).
+
+Results:
+- Magnitude baseline (`wanda_probe_magnitude`):
+  - artifact_size_mb: `0.159112`
+  - val_loss: `2.541510`
+- Wanda (`wanda_probe_wanda`):
+  - artifact_size_mb: `0.158799`
+  - val_loss: `2.587195`
+- Delta (`wanda - magnitude`):
+  - size: `-0.000313 MB` (slightly smaller)
+  - loss: `+0.045685` (worse)
+
+Decision:
+- Drop Wanda in current form for toy frontier work.
+
+Learnings:
+- This lightweight Wanda implementation did not improve the quality/size frontier.
+- The tiny size gain is not worth the observed loss regression.
+
+Next:
+- Keep using magnitude/structured modes for current branch.
+- If revisiting Wanda later, limit scope to selected layers and test non-progressive one-shot pruning.
+
+## 2026-03-20 - AWQ-lite channel protection probe (paper idea #3)
+
+Context:
+- Implemented AWQ-lite style channel-level protection in quantization/QAT path.
+
+Changes:
+- Files changed:
+  - `toy_model/quantize.py`
+  - `toy_model/size_report.py`
+  - `toy_model/train.py`
+  - `toy_model/run_awq_lite_probe.py`
+- Added quantization knobs:
+  - `quantize.protect_frac`
+  - `quantize.protect_min_cols`
+
+Results:
+- Baseline (`protect_frac=0.00`):
+  - artifact_size_mb: `0.159883`
+  - val_loss: `2.541510`
+- AWQ-lite (`protect_frac=0.02`):
+  - artifact_size_mb: `0.168137`
+  - val_loss: `2.538804`
+  - delta vs base: `loss -0.002706`, `size +0.008254 MB`
+- AWQ-lite (`protect_frac=0.05`):
+  - artifact_size_mb: `0.169952`
+  - val_loss: `2.540311`
+  - delta vs base: `loss -0.001199`, `size +0.010070 MB`
+
+Decision:
+- Drop AWQ-lite for current compact frontier goals.
+
+Learnings:
+- Channel protection gives only tiny quality gains while adding non-trivial size overhead.
+- Not competitive against current objective (min size with strong loss).
+
+Next:
+- Move to another research axis (e.g., intermediate-feature distillation) instead of more AWQ-lite tuning.
+
+## 2026-03-20 - MLA latent KV bottleneck probe (DeepSeek-inspired)
+
+Context:
+- Implemented an MLA-style latent KV bottleneck in attention and tested whether it improves compact frontier.
+
+Changes:
+- Files changed:
+  - `toy_model/model.py`
+  - `toy_model/train.py`
+  - `toy_model/run_mla_probe.py`
+- New model knob:
+  - `model.attn_kv_latent_dim` (`null` disables)
+
+Results:
+- Base (`attn_kv_latent_dim=null`):
+  - artifact_size_mb: `0.241073`
+  - val_loss: `1.535272`
+- Latent 16:
+  - artifact_size_mb: `0.238442` (delta `-0.002630`)
+  - val_loss: `2.074323` (delta `+0.539051`)
+- Latent 24:
+  - artifact_size_mb: `0.239343` (delta `-0.001730`)
+  - val_loss: `1.740130` (delta `+0.204858`)
+- Latent 32:
+  - artifact_size_mb: `0.240205` (delta `-0.000868`)
+  - val_loss: `1.902933` (delta `+0.367661`)
+
+Decision:
+- Drop MLA latent KV for current toy objective.
+
+Learnings:
+- In this setup, latent KV gave only tiny size savings while causing meaningful quality regressions.
+- Not competitive with current compact frontier tradeoff.
+
+Next:
+- Continue with other research axes (e.g., intermediate-feature distillation), not MLA bottleneck.
+
 ## 2026-03-20 - Three-path toy research sweep
 
 Context:
@@ -553,3 +758,149 @@ Learnings:
 
 Next:
 - Stop broad architecture search here unless the leaderboard context suggests a specific new knob worth testing.
+
+## 2026-03-20 - RunPod 1xH100 real-pipeline reference run
+
+Context:
+- Ran `train_gpt.py` on RunPod secure cloud with 1x H100 to get a real baseline for this repo on cached FineWeb (`sp1024`).
+
+Changes:
+- Infra/runtime only; no code changes.
+- Pod profile: secure cloud, 1x H100, `torchrun --standalone --nproc_per_node=1`.
+- Dataset command used: `python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 1`.
+- Training command used:
+  - `RUN_ID=... DATA_PATH=./data/datasets/fineweb10B_sp1024/ TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model VOCAB_SIZE=1024 MAX_WALLCLOCK_SECONDS=600 torchrun --standalone --nproc_per_node=1 train_gpt.py`
+
+Results:
+- stop_step: `1133/20000` (wallclock cap at `600271ms`)
+- step_time_avg_ms: `529.81`
+- peak_mem: `allocated=10239 MiB`, `reserved=10730 MiB`
+- final_exact:
+  - `val_loss=2.27510323`
+  - `val_bpb=1.34744428`
+- artifact sizes:
+  - `Total submission size=67,279,676 bytes`
+  - `Total submission size int8+zlib=12,881,371 bytes` (within 16 MB limit)
+
+Decision:
+- Keep as current real-run reference baseline for 1xH100.
+
+Learnings:
+- Current pipeline is stable on RunPod and produces a valid compressed artifact under the challenge limit.
+- Quality is substantially better than short smoke runs and is suitable as a baseline for next tuning passes.
+
+Next:
+- Compare against an 8xH100 competition run and evaluate scaling/per-dollar tradeoff.
+
+## 2026-03-20 - Cleanup no-go probes and test hidden-state distillation
+
+Context:
+- User requested the next paper-style compression idea while removing experiments we no longer need in code.
+- Chosen next idea: TinyBERT-style intermediate hidden-state distillation.
+
+Changes:
+- Removed no-go probe code paths and scripts:
+  - `toy_model/run_wanda_probe.py` (already removed), `toy_model/run_awq_lite_probe.py`, `toy_model/run_mla_probe.py`
+  - removed Wanda pruning path from `toy_model/prune.py` and `toy_model/train.py`
+  - removed AWQ-lite protection knobs from `toy_model/quantize.py`, `toy_model/size_report.py`, and `toy_model/train.py`
+  - removed MLA latent-KV branch from `toy_model/model.py` and `toy_model/train.py`
+- Added hidden-state distillation support:
+  - `toy_model/model.py` now supports `return_hidden=True`
+  - `toy_model/train.py` adds optional `distill.hidden_enabled` + `distill.hidden_weight`
+  - `toy_model/run_hidden_distill_probe.py` created
+- Removed stale no-go temp/probe artifacts from `toy_model/tmp_*` and `toy_model/runs/*probe*` for Wanda/AWQ/MLA.
+
+Results:
+- Hidden-distill probe (run via `.venv_pg`):
+  - baseline logits-only (`hidden_probe_base`): `artifact_size_mb=0.1587`, `val_loss=2.5415`
+  - hidden weight `0.05` (`hidden_probe_w005`): `artifact_size_mb=0.1543`, `val_loss=2.7142`
+  - hidden weight `0.10` (`hidden_probe_w010`): `artifact_size_mb=0.1592`, `val_loss=2.7436`
+- Summary file: `toy_model/runs/hidden_distill_probe_summary.json`
+
+Decision:
+- Keep code cleanup.
+- Drop hidden-state distillation for now (clear quality regression vs logits-only baseline).
+
+Learnings:
+- On this toy setup, extra hidden alignment over-constrains the compact student and hurts final loss.
+- The existing logits distillation remains stronger for current objective.
+
+Next:
+- Keep `toyfocus` baseline and test only new mechanisms with clear size-loss upside.
+
+## 2026-03-20 - ALiBi positional encoding probe (paper idea #1)
+
+Context:
+- Implemented requested next idea: replace learned positional embeddings with ALiBi bias.
+- Goal: reduce bytes and improve stability/quality at toyfocus settings.
+
+Changes:
+- Files changed:
+  - `toy_model/model.py` (added `model.positional_encoding` with ALiBi support)
+  - `toy_model/train.py` (plumbed config and metrics logging)
+  - `toy_model/config.yaml`, `toy_model/config_distill_qat.yaml`, `toy_model/config_toyfocus_best.yaml`
+  - `toy_model/run_alibi_probe.py`
+  - docs/trackers updated
+
+Results:
+- Probe summary: `toy_model/runs/alibi_probe_summary.json`
+- Learned positional embeddings:
+  - parameter_count: `168,128`
+  - artifact_size_mb: `0.159216`
+  - val_loss: `2.541510`
+- ALiBi:
+  - parameter_count: `159,936`
+  - artifact_size_mb: `0.156304`
+  - val_loss: `2.385367`
+- Delta (ALiBi vs learned):
+  - `delta_artifact_size_mb = -0.002912`
+  - `delta_val_loss = -0.156143`
+
+Decision:
+- Keep ALiBi.
+- Promote `config_toyfocus_best.yaml` to `model.positional_encoding=alibi`.
+
+Learnings:
+- In this toy setup, ALiBi is a strict win on both size and loss.
+- Removing learned position embeddings reduced params and helped compact frontier quality.
+
+Next:
+- Run a small follow-up around ALiBi with tiny prune/temp perturbations to confirm robustness.
+
+## 2026-03-20 - Mixed-bit quantization probe on ALiBi baseline (paper idea #4)
+
+Context:
+- Implemented layer-wise mixed-bit quantization to test if it complements the new ALiBi baseline.
+
+Changes:
+- Files changed:
+  - `toy_model/quantize.py`: added bit-packing for non-4-bit (`2..7`) and pattern-based per-layer bit overrides
+  - `toy_model/size_report.py`: plumbed `quant_layer_bits` through artifact-size estimation
+  - `toy_model/train.py`: reads `quantize.layer_bits`, applies in QAT fake-quant and payload estimate, logs metrics
+  - `toy_model/run_mixedbit_probe.py`: 7-case mixed-bit probe runner (desktop-safe with 2 workers)
+  - Added compact preset: `toy_model/config_toyfocus_mixedbit_compact.yaml`
+
+Results:
+- Probe summary: `toy_model/runs/mixedbit_probe_summary.json`
+- Baseline (`quant_bits=4`, ALiBi):
+  - artifact_size_mb: `0.157160`
+  - val_loss: `2.385367`
+- Best compact variant (`quant_bits=3`):
+  - artifact_size_mb: `0.144482`
+  - val_loss: `2.388274`
+- Delta (int3 vs int4 baseline):
+  - `delta_artifact_size_mb = -0.012678`
+  - `delta_val_loss = +0.002907`
+- Selective override sets (`quantize.layer_bits`) were neutral in this toy setup.
+
+Decision:
+- Keep mixed-bit capability.
+- Keep `config_toyfocus_best.yaml` as quality-first baseline.
+- Keep `config_toyfocus_mixedbit_compact.yaml` as compact-size preset.
+
+Learnings:
+- ALiBi + global int3 is a strong compact point with negligible loss regression.
+- Fine-grained per-layer overrides did not beat simple global int3/int4 tradeoff in current toy model.
+
+Next:
+- Move to next high-upside mechanism: attention-map distillation (`#2`) or 2:4 sparsity with sparse-aware packing (`#3`).

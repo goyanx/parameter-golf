@@ -15,7 +15,11 @@ import yaml
 
 from lowrank import maybe_replace_linear
 from model import ModelConfig, TinyTransformerLM
-from prune import global_sparsity, magnitude_prune_model, structured_prune_model
+from prune import (
+    global_sparsity,
+    magnitude_prune_model,
+    structured_prune_model,
+)
 from quantize import fake_quantize_model_inplace
 from size_report import bytes_to_mb, estimate_artifact_bytes, parameter_count
 from tokenizer import load_text, train_val_tokens
@@ -60,6 +64,7 @@ def build_model(cfg: Dict) -> TinyTransformerLM:
         max_seq_len=cfg["model"]["max_seq_len"],
         dropout=cfg["model"].get("dropout", 0.0),
         weight_sharing=cfg["model"].get("weight_sharing", False),
+        positional_encoding=cfg["model"].get("positional_encoding", "learned"),
     )
     model = TinyTransformerLM(model_cfg)
     lowrank_cfg = cfg.get("lowrank", {})
@@ -86,6 +91,37 @@ def _to_patterns(v) -> tuple[str, ...]:
     if isinstance(v, str):
         return (v,)
     return tuple(str(x) for x in v)
+
+
+def _to_layer_bits(v) -> tuple[tuple[str, int], ...]:
+    if not v:
+        return ()
+    if isinstance(v, dict):
+        items = v.items()
+    elif isinstance(v, list):
+        out = []
+        for e in v:
+            if not isinstance(e, dict):
+                continue
+            p = str(e.get("pattern", "")).strip()
+            if not p:
+                continue
+            try:
+                b = int(e.get("bits", 0))
+            except (TypeError, ValueError):
+                continue
+            out.append((p, b))
+        return tuple(out)
+    else:
+        return ()
+    out = []
+    for p, b in items:
+        try:
+            ib = int(b)
+        except (TypeError, ValueError):
+            continue
+        out.append((str(p), ib))
+    return tuple(out)
 
 def _teacher_from_distill_cfg(cfg: Dict, model_cfg: Dict) -> Optional[Dict]:
     dcfg = cfg.get("distill", {})
@@ -153,6 +189,7 @@ def main() -> None:
     quant_exclude_patterns = _to_patterns(cfg.get("quantize", {}).get("exclude_patterns", []))
     quant_fallback_dtype = str(cfg.get("quantize", {}).get("fallback_dtype", "fp16"))
     quant_pack_order = str(cfg.get("quantize", {}).get("pack_order", "state_dict"))
+    quant_layer_bits = _to_layer_bits(cfg.get("quantize", {}).get("layer_bits", {}))
     distill_cfg = cfg.get("distill", {})
     distill_enabled = bool(distill_cfg.get("enabled", False))
     distill_alpha = float(distill_cfg.get("alpha", 0.5))
@@ -160,6 +197,8 @@ def main() -> None:
     distill_alpha_end = float(distill_cfg.get("alpha_end", distill_alpha))
     distill_schedule = str(distill_cfg.get("alpha_schedule", "constant"))
     distill_temp = float(distill_cfg.get("temperature", 2.0))
+    distill_hidden_enabled = bool(distill_cfg.get("hidden_enabled", False))
+    distill_hidden_weight = float(distill_cfg.get("hidden_weight", 0.1))
     teacher_steps = int(distill_cfg.get("teacher_steps", 0))
     grad_clip = float(cfg["train"].get("grad_clip", 0.0))
 
@@ -175,10 +214,16 @@ def main() -> None:
     applied_prune_target = 0.0
 
     teacher_model: Optional[TinyTransformerLM] = None
+    hidden_projector: Optional[torch.nn.Module] = None
     if distill_enabled:
         teacher_model_cfg = _teacher_from_distill_cfg(cfg, cfg["model"]) or cfg["model"]
         teacher_bundle = {"model": teacher_model_cfg, "lowrank": {"rank": None}}
         teacher_model = build_model(teacher_bundle).to(device)
+        if distill_hidden_enabled:
+            s_dim = int(cfg["model"]["d_model"])
+            t_dim = int(teacher_model_cfg.get("d_model", s_dim))
+            if t_dim != s_dim:
+                hidden_projector = torch.nn.Linear(t_dim, s_dim, bias=False).to(device)
         teacher_opt = optim.AdamW(teacher_model.parameters(), lr=float(distill_cfg.get("teacher_lr", cfg["train"]["lr"])))
         for tstep in range(1, teacher_steps + 1):
             xb, yb = get_batch(splits["train"], batch_size, seq_len, device)
@@ -192,25 +237,45 @@ def main() -> None:
         teacher_model.eval()
         for p in teacher_model.parameters():
             p.requires_grad_(False)
+        if hidden_projector is not None:
+            for p in hidden_projector.parameters():
+                p.requires_grad_(True)
+            opt.add_param_group({"params": hidden_projector.parameters()})
 
     start = time.perf_counter()
     for step in range(1, steps + 1):
         xb, yb = get_batch(splits["train"], batch_size, seq_len, device)
-        slogits, ce_loss = model(xb, yb)
+        if distill_enabled and distill_hidden_enabled:
+            slogits, ce_loss, shid = model(xb, yb, return_hidden=True)
+        else:
+            slogits, ce_loss = model(xb, yb)
+            shid = None
         if distill_enabled and teacher_model is not None:
             with torch.no_grad():
-                tlogits, _ = teacher_model(xb, None)
+                if distill_hidden_enabled:
+                    tlogits, _, thid = teacher_model(xb, None, return_hidden=True)
+                else:
+                    tlogits, _ = teacher_model(xb, None)
+                    thid = None
             if distill_schedule == "linear":
                 alpha_t = _interp_linear(distill_alpha_start, distill_alpha_end, step, steps)
             else:
                 alpha_t = distill_alpha
-            loss, ce_part, kd_part = _distill_loss(
+            loss, _, _ = _distill_loss(
                 student_logits=slogits,
                 teacher_logits=tlogits,
                 targets=yb,
                 alpha=alpha_t,
                 temperature=distill_temp,
             )
+            if distill_hidden_enabled:
+                assert shid is not None and thid is not None
+                t_h = thid
+                s_h = shid
+                if hidden_projector is not None:
+                    t_h = hidden_projector(t_h)
+                hidden_loss = F.mse_loss(s_h, t_h)
+                loss = loss + distill_hidden_weight * hidden_loss
         else:
             loss = ce_loss
         opt.zero_grad(set_to_none=True)
@@ -287,6 +352,7 @@ def main() -> None:
                     bits=int(quant_bits),
                     group_size=quant_group_size,
                     exclude_patterns=quant_exclude_patterns or ("token_emb", "head", "ln", "norm"),
+                    layer_bits=quant_layer_bits,
                 )
             xb, yb = get_batch(splits["train"], batch_size, seq_len, device)
             _, loss = model(xb, yb)
@@ -307,6 +373,7 @@ def main() -> None:
         quant_exclude_patterns=quant_exclude_patterns or ("token_emb", "head", "ln", "norm"),
         quant_fallback_dtype=quant_fallback_dtype,
         quant_pack_order=quant_pack_order,
+        quant_layer_bits=quant_layer_bits,
     )
     params = parameter_count(model)
     nonzero, total, sparsity = global_sparsity(model)
@@ -336,14 +403,19 @@ def main() -> None:
         "prune_exclude_patterns": list(prune_exclude_patterns),
         "quant_bits": quant_bits,
         "quant_group_size": quant_group_size,
+        "attn_kv_heads": cfg["model"].get("attn_kv_heads"),
+        "positional_encoding": cfg["model"].get("positional_encoding", "learned"),
         "quant_exclude_patterns": list(quant_exclude_patterns),
         "quant_pack_order": quant_pack_order,
+        "quant_layer_bits": [{"pattern": p, "bits": b} for p, b in quant_layer_bits],
         "distill_enabled": distill_enabled,
         "distill_alpha": distill_alpha,
         "distill_alpha_start": distill_alpha_start,
         "distill_alpha_end": distill_alpha_end,
         "distill_schedule": distill_schedule,
         "distill_temperature": distill_temp,
+        "distill_hidden_enabled": distill_hidden_enabled,
+        "distill_hidden_weight": distill_hidden_weight,
         "teacher_steps": teacher_steps,
         "grad_clip": grad_clip,
         "progressive_prune_enabled": progressive_prune_enabled,

@@ -35,6 +35,7 @@ def estimate_model_bytes(
     quant_exclude_patterns: tuple[str, ...] = ("token_emb", "head", "ln", "norm"),
     quant_fallback_dtype: str = "fp16",
     quant_pack_order: str = "state_dict",
+    quant_layer_bits: tuple[tuple[str, int], ...] = (),
 ) -> int:
     payload = model_payload_bytes(
         model,
@@ -43,6 +44,7 @@ def estimate_model_bytes(
         quant_exclude_patterns=quant_exclude_patterns,
         quant_fallback_dtype=quant_fallback_dtype,
         quant_pack_order=quant_pack_order,
+        quant_layer_bits=quant_layer_bits,
     )
     return len(payload)
 
@@ -54,6 +56,7 @@ def model_payload_bytes(
     quant_exclude_patterns: tuple[str, ...] = ("token_emb", "head", "ln", "norm"),
     quant_fallback_dtype: str = "fp16",
     quant_pack_order: str = "state_dict",
+    quant_layer_bits: tuple[tuple[str, int], ...] = (),
 ) -> bytes:
     if quant_bits is None:
         return _payload_from_state_dict(model.state_dict())
@@ -63,6 +66,7 @@ def model_payload_bytes(
         exclude_patterns=quant_exclude_patterns,
         fallback_dtype=quant_fallback_dtype,
         pack_order=quant_pack_order,
+        layer_bits=quant_layer_bits,
     )
     return _payload_from_quantized_state(model, quant_cfg=qcfg)
 
@@ -75,6 +79,7 @@ def estimate_artifact_bytes(
     quant_exclude_patterns: tuple[str, ...] = ("token_emb", "head", "ln", "norm"),
     quant_fallback_dtype: str = "fp16",
     quant_pack_order: str = "state_dict",
+    quant_layer_bits: tuple[tuple[str, int], ...] = (),
     include_files: list[str] | None = None,
 ) -> int:
     code_dir = Path(code_dir)
@@ -101,6 +106,7 @@ def estimate_artifact_bytes(
                 quant_exclude_patterns=quant_exclude_patterns,
                 quant_fallback_dtype=quant_fallback_dtype,
                 quant_pack_order=quant_pack_order,
+                quant_layer_bits=quant_layer_bits,
             )
             zf.writestr("model_payload.bin", model_payload)
             zf.writestr("model_size_bytes.json", json.dumps({"model_bytes": len(model_payload)}))

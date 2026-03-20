@@ -19,10 +19,34 @@ class ModelConfig:
     max_seq_len: int = 128
     dropout: float = 0.0
     weight_sharing: bool = False
+    positional_encoding: str = "learned"
+
+
+def _alibi_slopes(n_heads: int, device: torch.device) -> torch.Tensor:
+    # Matches the ALiBi paper construction used in many reference impls.
+    def _get_slopes_power_of_2(n: int) -> list[float]:
+        start = 2.0 ** (-2.0 ** (-(math.log2(n) - 3)))
+        ratio = start
+        return [start * (ratio ** i) for i in range(n)]
+
+    if math.log2(n_heads).is_integer():
+        slopes = _get_slopes_power_of_2(n_heads)
+    else:
+        closest = 2 ** math.floor(math.log2(n_heads))
+        slopes = _get_slopes_power_of_2(closest)
+        extra = _get_slopes_power_of_2(2 * closest)[0::2]
+        slopes += extra[: n_heads - closest]
+    return torch.tensor(slopes, dtype=torch.float32, device=device)
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float, kv_heads: int | None = None) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float,
+        kv_heads: int | None = None,
+    ) -> None:
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError("d_model must be divisible by n_heads")
@@ -41,10 +65,10 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor, alibi_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         b, t, c = x.shape
-        qkv = self.qkv(x)
         kv_width = self.kv_heads * self.head_dim
+        qkv = self.qkv(x)
         q = qkv[..., : self.d_model]
         k = qkv[..., self.d_model : self.d_model + kv_width]
         v = qkv[..., self.d_model + kv_width :]
@@ -58,6 +82,8 @@ class CausalSelfAttention(nn.Module):
             v = v.repeat_interleave(self.head_group_size, dim=1)
 
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if alibi_bias is not None:
+            att = att + alibi_bias
         att = att.masked_fill(attn_mask == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
         att = self.dropout(att)
@@ -83,15 +109,26 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float, attn_kv_heads: int | None = None) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        dropout: float,
+        attn_kv_heads: int | None = None,
+    ) -> None:
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout, kv_heads=attn_kv_heads)
+        self.attn = CausalSelfAttention(
+            d_model,
+            n_heads,
+            dropout,
+            kv_heads=attn_kv_heads,
+        )
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = MLP(d_model, dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), attn_mask)
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor, alibi_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), attn_mask, alibi_bias=alibi_bias)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -101,16 +138,31 @@ class TinyTransformerLM(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.token_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
+        if cfg.positional_encoding == "learned":
+            self.pos_emb = nn.Embedding(cfg.max_seq_len, cfg.d_model)
+        elif cfg.positional_encoding == "alibi":
+            self.pos_emb = None
+        else:
+            raise ValueError("positional_encoding must be 'learned' or 'alibi'")
         self.drop = nn.Dropout(cfg.dropout)
 
         if cfg.weight_sharing:
-            self.shared_block = TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout, attn_kv_heads=cfg.attn_kv_heads)
+            self.shared_block = TransformerBlock(
+                cfg.d_model,
+                cfg.n_heads,
+                cfg.dropout,
+                attn_kv_heads=cfg.attn_kv_heads,
+            )
             self.blocks = None
         else:
             self.blocks = nn.ModuleList(
                 [
-                    TransformerBlock(cfg.d_model, cfg.n_heads, cfg.dropout, attn_kv_heads=cfg.attn_kv_heads)
+                    TransformerBlock(
+                        cfg.d_model,
+                        cfg.n_heads,
+                        cfg.dropout,
+                        attn_kv_heads=cfg.attn_kv_heads,
+                    )
                     for _ in range(cfg.n_layers)
                 ]
             )
@@ -123,29 +175,44 @@ class TinyTransformerLM(nn.Module):
     def _attn_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
         return torch.tril(torch.ones((1, 1, seq_len, seq_len), device=device))
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+    def _alibi_bias(self, seq_len: int, device: torch.device) -> Optional[torch.Tensor]:
+        if self.cfg.positional_encoding != "alibi":
+            return None
+        slopes = _alibi_slopes(self.cfg.n_heads, device=device).view(1, self.cfg.n_heads, 1, 1)
+        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+        rel = pos.view(1, 1, 1, seq_len) - pos.view(1, 1, seq_len, 1)
+        rel = rel.clamp_max(0.0)
+        return rel * slopes
+
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, return_hidden: bool = False):
         b, t = idx.shape
         if t > self.cfg.max_seq_len:
             raise ValueError(f"Input length {t} exceeds max_seq_len={self.cfg.max_seq_len}")
 
-        pos = torch.arange(0, t, device=idx.device).unsqueeze(0)
-        x = self.token_emb(idx) + self.pos_emb(pos)
+        x = self.token_emb(idx)
+        if self.pos_emb is not None:
+            pos = torch.arange(0, t, device=idx.device).unsqueeze(0)
+            x = x + self.pos_emb(pos)
         x = self.drop(x)
         mask = self._attn_mask(t, idx.device)
+        alibi_bias = self._alibi_bias(t, idx.device)
 
         if self.cfg.weight_sharing:
             assert self.shared_block is not None
             for _ in range(self.cfg.n_layers):
-                x = self.shared_block(x, mask)
+                x = self.shared_block(x, mask, alibi_bias=alibi_bias)
         else:
             assert self.blocks is not None
             for blk in self.blocks:
-                x = blk(x, mask)
+                x = blk(x, mask, alibi_bias=alibi_bias)
 
         x = self.ln_f(x)
+        hidden = x
         logits = self.head(x)
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        if return_hidden:
+            return logits, loss, hidden
         return logits, loss

@@ -24,6 +24,7 @@ class QuantConfig:
     exclude_patterns: tuple[str, ...] = ("token_emb", "head", "ln", "norm")
     fallback_dtype: str = "fp16"
     pack_order: str = "state_dict"
+    layer_bits: tuple[tuple[str, int], ...] = ()
 
 
 def _quant_bounds(bits: int) -> Tuple[int, int]:
@@ -74,6 +75,65 @@ def _pack_nibbles_u4(q: torch.Tensor) -> bytes:
     return packed.numpy().tobytes()
 
 
+def _pack_bits(q: torch.Tensor, bits: int) -> bytes:
+    if bits == 4:
+        return _pack_nibbles_u4(q)
+    if bits >= 8:
+        return q.view(-1).to(torch.uint8).numpy().tobytes()
+    flat = q.view(-1).to(torch.uint8)
+    out = bytearray()
+    acc = 0
+    acc_bits = 0
+    mask = (1 << bits) - 1
+    for v in flat.tolist():
+        acc |= (int(v) & mask) << acc_bits
+        acc_bits += bits
+        while acc_bits >= 8:
+            out.append(acc & 0xFF)
+            acc >>= 8
+            acc_bits -= 8
+    if acc_bits > 0:
+        out.append(acc & 0xFF)
+    return bytes(out)
+
+
+def _parse_layer_bits(layer_bits: object) -> tuple[tuple[str, int], ...]:
+    if not layer_bits:
+        return ()
+    if isinstance(layer_bits, dict):
+        items = layer_bits.items()
+    elif isinstance(layer_bits, list):
+        parsed = []
+        for entry in layer_bits:
+            if not isinstance(entry, dict):
+                continue
+            pat = str(entry.get("pattern", "")).strip()
+            bits = int(entry.get("bits", 0))
+            if not pat:
+                continue
+            parsed.append((pat, bits))
+        return tuple(parsed)
+    else:
+        return ()
+    out = []
+    for pat, bits in items:
+        try:
+            b = int(bits)
+        except (TypeError, ValueError):
+            continue
+        out.append((str(pat), b))
+    return tuple(out)
+
+
+def _bits_for_name(name: str, default_bits: int, layer_bits: tuple[tuple[str, int], ...]) -> int:
+    n = name.lower()
+    bits = int(default_bits)
+    for pattern, b in layer_bits:
+        if pattern.lower() in n:
+            bits = int(b)
+    return bits
+
+
 def _quantize_row_groupwise_2d(t: torch.Tensor, bits: int, group_size: int) -> QuantizedTensor:
     if t.ndim != 2:
         raise ValueError("Expected 2D tensor for row-groupwise quantization")
@@ -105,7 +165,7 @@ def _quantize_row_groupwise_2d(t: torch.Tensor, bits: int, group_size: int) -> Q
             scale[r, g] = sc
             zero_point[r, g] = zp
 
-    packed = _pack_nibbles_u4(q) if bits == 4 else None
+    packed = _pack_bits(q, bits=bits) if bits < 8 else None
     return QuantizedTensor(qweight=q, scale=scale, zero_point=zero_point, bits=bits, packed_bytes=packed)
 
 
@@ -167,25 +227,29 @@ def fake_quantize_model_inplace(
     bits: int = 4,
     group_size: int = 64,
     exclude_patterns: Iterable[str] = ("token_emb", "head", "ln", "norm"),
+    layer_bits: object = None,
 ) -> None:
+    overrides = _parse_layer_bits(layer_bits)
     with torch.no_grad():
         for name, p in model.named_parameters():
             if not p.requires_grad or not torch.is_floating_point(p):
                 continue
             if _should_exclude(name, exclude_patterns):
                 continue
+            b = _bits_for_name(name, default_bits=int(bits), layer_bits=overrides)
             cpu = p.detach().cpu()
-            if bits == 4 and cpu.ndim >= 2:
-                qt = quantize_tensor_groupwise(cpu, bits=bits, group_size=group_size)
+            if b <= 7 and cpu.ndim >= 2:
+                qt = quantize_tensor_groupwise(cpu, bits=b, group_size=group_size)
                 dq = dequantize_tensor_groupwise(qt, cpu.shape, group_size=group_size)
             else:
-                qt = quantize_tensor_affine(cpu, bits=bits)
+                qt = quantize_tensor_affine(cpu, bits=b)
                 dq = dequantize_tensor_affine(qt).reshape(cpu.shape)
             p.copy_(dq.to(device=p.device, dtype=p.dtype))
 
 
 def quantized_payload_bytes(model: nn.Module, cfg: QuantConfig) -> bytes:
     chunks = []
+    layer_bits = _parse_layer_bits(cfg.layer_bits)
     items = list(model.state_dict().items())
     if cfg.pack_order == "name":
         items = sorted(items, key=lambda kv: kv[0])
@@ -205,13 +269,14 @@ def quantized_payload_bytes(model: nn.Module, cfg: QuantConfig) -> bytes:
                 payload = t.half().numpy().tobytes()
             chunks.append(payload)
             continue
-        if cfg.bits == 4 and t.ndim >= 2:
-            qt = quantize_tensor_groupwise(t, bits=cfg.bits, group_size=cfg.group_size)
-            chunks.append(qt.packed_bytes or b"")
+        b = _bits_for_name(name, default_bits=int(cfg.bits), layer_bits=layer_bits)
+        if b <= 7 and t.ndim >= 2:
+            qt = quantize_tensor_groupwise(t, bits=b, group_size=cfg.group_size)
+            chunks.append(qt.packed_bytes or qt.qweight.numpy().tobytes())
             chunks.append(qt.scale.numpy().tobytes())
             chunks.append(qt.zero_point.numpy().tobytes())
         else:
-            qt = quantize_tensor_affine(t, bits=cfg.bits)
+            qt = quantize_tensor_affine(t, bits=b)
             chunks.append(qt.qweight.numpy().tobytes())
             chunks.append(qt.scale.numpy().tobytes())
             chunks.append(qt.zero_point.numpy().tobytes())
