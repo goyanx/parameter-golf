@@ -1146,3 +1146,75 @@ Learnings:
 Next:
 - Run the same guardrail on CUDA desktop to retune `batch_size`/`time_budget_sec` for GPU throughput.
 - If frontier stalls, introduce a new mechanism inspired by recent Qwen/DeepSeek papers (e.g., expert routing, grouped low-rank adapters, or better distillation targets).
+
+## 2026-03-22 - 8xH100 promoted preset run (interrupted pod)
+
+Context:
+- Ran the newly promoted real-pipeline preset on RunPod 8xH100 SXM using the official `runpod/parameter-golf:latest` template.
+
+Changes:
+- Infra/runtime execution only; no code changes during run.
+- Launch details:
+  - pod id: `lui2ed89ipiiza`
+  - command: `torchrun --standalone --nproc_per_node=8 train_gpt.py`
+  - env:
+    - `COMPRESSION_PRESET=toy_promoted`
+    - `DATA_PATH=./data/datasets/fineweb10B_sp1024`
+    - `TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model`
+    - `VOCAB_SIZE=1024`
+    - `MAX_WALLCLOCK_SECONDS=600`
+
+Results:
+- Training progressed to around `step 10000/20000` before interruption.
+- Intermediate validation:
+  - best observed `val_bpb ~1.7795` at around step `5000`
+  - observed `val_bpb ~1.7834` at step `10000`
+- Failure mode:
+  - remote pod connection closed and subsequent API check returned `pod not found (404)`.
+  - final artifact serialization lines were not produced/captured.
+
+Decision:
+- Keep promoted preset path.
+- Re-run with persistent storage and stronger artifact retention before treating as submission evidence.
+
+Learnings:
+- The promoted preset is stable enough to run deeply on 8 GPUs.
+- Without persistent storage/checkpoint sync, expensive 8x runs are brittle and can be lost.
+
+Next:
+- Provision next 8xH100 run with mounted persistent volume/network volume.
+- Stream logs to durable storage and copy final artifacts immediately at completion.
+
+## 2026-03-22 - Official submission and sponsor-credit requirements verified
+
+Context:
+- User requested up-to-date requirements for challenge submission and RunPod credit application inputs.
+
+Changes:
+- Reviewed official Parameter Golf README and OpenAI challenge page.
+
+Results:
+- Submission requirements (record track) currently require:
+  - measurable improvement threshold over SOTA (`>= 0.005` nats, with significance evidence)
+  - correct `val_bpb` proof if tokenizer/dataset changed
+  - reproducible run under `10 minutes` on `8xH100`
+  - PR that adds one folder under `/records/...` including:
+    - `README.md`
+    - `submission.json`
+    - train log(s)
+    - runnable `train_gpt.py` plus dependencies
+- Non-record submissions are accepted with the same records-folder structure if they are interesting and valid under artifact constraints.
+- Sponsor-related links confirmed:
+  - compute grant form: `https://openai.com/index/parameter-golf/#credit-form`
+  - participant form: `https://jobs.ashbyhq.com/openai/form/open-ai-challenge-parameter-golf`
+
+Decision:
+- Keep submission on hold until a complete durable 8xH100 run artifact/log package is captured.
+
+Learnings:
+- We can submit from a fork by opening a PR from `goyanx/parameter-golf` branch into `openai/parameter-golf` base branch.
+- A complete records folder is the gating deliverable, not just code diffs in root scripts.
+
+Next:
+- Assemble records-folder template and fill from the next completed 8xH100 run.
+- Authenticate `gh` locally before PR automation.

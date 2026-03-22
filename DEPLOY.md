@@ -103,6 +103,7 @@ python train_gpt.py
 ## Runpod Checklist
 
 - Confirm mounted storage path for dataset and tokenizer.
+- Prefer attaching persistent storage/network volume for expensive multi-GPU runs.
 - Export `DATA_PATH` and `TOKENIZER_PATH` correctly.
 - Use fixed `RUN_ID` per trial.
 - Capture stdout/stderr to a run-specific log file.
@@ -110,6 +111,15 @@ python train_gpt.py
   - `final_model.pt`
   - `final_model.int8.ptz`
   - log file
+
+## Incident Note (2026-03-22)
+
+- A promoted 8xH100 run (`COMPRESSION_PRESET=toy_promoted`) reached around step `10000/20000` with best observed intermediate `val_bpb~1.7795`, but the pod was deleted before final artifact serialization.
+- Operational fix for next runs:
+  - mount persistent storage
+  - tee logs to mounted path
+  - copy final artifacts immediately after training
+  - optionally add periodic checkpoint snapshots to mounted path
 
 ## Suggested First Runpod Matrix
 

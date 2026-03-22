@@ -52,11 +52,14 @@ Progress tracker for local development and challenge readiness.
 
 ## Challenge Prep
 
-- [ ] Review current official submission requirements in `README.md` of challenge repo.
+- [x] Review current official submission requirements in `README.md` of challenge repo.
 - [ ] Draft `records/...` submission folder structure.
 - [ ] Prepare execution script, logs, and concise write-up.
 - [ ] Dry-run packaging and reproducibility checks.
 - [ ] Submit PR when metrics and constraints are satisfied.
+- [ ] Configure persistent RunPod storage for 8xH100 runs so logs/artifacts survive pod loss.
+- [ ] Authenticate GitHub CLI (`gh auth login`) on this workstation for PR automation.
+- [ ] Prepare compute-credit application packet (evidence + links + goals + account details).
 
 ## Ongoing Discipline
 

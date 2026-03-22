@@ -148,6 +148,21 @@
   - final exact: `val_loss=2.27510323`, `val_bpb=1.34744428`
   - compressed submission size: `12,881,371 bytes` (under 16MB)
   - detailed record stored in top-level `memory.md`
+- RunPod real-pipeline promoted preset attempt (non-toy, `train_gpt.py`, 8xH100 SXM, 10-minute cap):
+  - launch config:
+    - `COMPRESSION_PRESET=toy_promoted`
+    - `torchrun --standalone --nproc_per_node=8 train_gpt.py`
+    - `DATA_PATH=./data/datasets/fineweb10B_sp1024`
+    - `TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model`
+  - observed progress before interruption:
+    - reached around `step 10000/20000`
+    - best observed intermediate `val_bpb ~1.7795` at step ~5000
+    - intermediate `val_bpb ~1.7834` at step ~10000
+  - outcome:
+    - pod was terminated/deleted before final serialization/evaluation
+    - no final `val_bpb` or final artifact-size line captured
+  - decision:
+    - re-run only with persistent volume + artifact sync and optional checkpointing cadence
 
 ## In Progress
 
@@ -161,6 +176,7 @@
   - MLA latent KV path removed
 - Current coding shortlist:
   - compare `train_gpt.py` baseline vs promoted toy stack on short smoke run
+  - execute a submission-grade 8xH100 rerun with durable artifact retention
   - keep toy exploration paused unless real-pipeline transfer reveals a gap
 
 ## Yet To Try
