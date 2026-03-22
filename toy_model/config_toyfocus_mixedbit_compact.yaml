@@ -33,6 +33,7 @@ quantize:
     - norm
   fallback_dtype: fp16
   layer_bits: {}
+  sparse_2_4_pack: false
 
 prune:
   amount: 0.12
@@ -60,6 +61,8 @@ distill:
   temperature: 2.2
   hidden_enabled: false
   hidden_weight: 0.1
+  attn_enabled: false
+  attn_weight: 0.05
   teacher_steps: 240
   teacher_lr: 0.001
   teacher_model:
@@ -70,3 +73,8 @@ distill:
     dropout: 0.0
     weight_sharing: false
     vocab_size: 256
+
+mtp:
+  enabled: false
+  weight: 0.1
+  horizons: [2]

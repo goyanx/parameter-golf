@@ -32,6 +32,13 @@ toy_model/
   run_hidden_distill_probe.py
   run_alibi_probe.py
   run_mixedbit_probe.py
+  run_attn_distill_probe.py
+  run_sparse24_pack_probe.py
+  run_teacher_retune_probe.py
+  run_toyfocus_confirm_probe.py
+  run_mtp_probe.py
+  run_seed_check.py
+  run_dual_preset_seed_check.py
   run_research_paths.py
   EXPERIMENT_TRACKER.md
   data/tiny_corpus.txt
@@ -65,6 +72,11 @@ Metrics are written to `toy_model/runs/<run-name>.json`.
 - Best compact-quality in recent toy sweeps:
   - `toy_model/config_toyfocus_best.yaml`
   - uses `model.positional_encoding=alibi`
+  - uses light attention-map distillation (`distill.attn_enabled=true`, `attn_weight=0.02`)
+  - confirmed with `teacher_steps=300`, `temperature=2.0`
+  - uses MTP aux loss (`mtp.enabled=true`, `horizons=[2,3]`, `weight=0.1`)
+- Best quality-focused toy preset:
+  - `toy_model/config_toyfocus_quality_best.yaml`
 - Best compact-size variant with small quality tradeoff:
   - `toy_model/config_toyfocus_mixedbit_compact.yaml`
 - Strong compact baseline:
@@ -203,8 +215,10 @@ Summary saved to `toy_model/runs/arch_combo_summary.json`.
 - `quantize.fallback_dtype`: `fp16` or `fp32` for excluded tensors
 - `quantize.pack_order`: `state_dict`, `name`, or `size_desc` ordering for payload packing
 - `quantize.layer_bits`: optional per-layer bit overrides, e.g. `{"attn.qkv": 3, "mlp.fc1": 5}`
+- `quantize.sparse_2_4_pack`: enable sparse-aware payload encoding for valid 2:4-pruned tensors
 - `prune.amount`: fraction in `[0.0, 1.0)`
 - `prune.mode`: `magnitude`, `row`, or `col`
+- `prune.mode`: `nm2_4` for deterministic 2:4 pruning on selected layers
 - `prune.include_patterns`: optional substrings that restrict pruning to selected layers
 - `prune.exclude_patterns`: optional substrings that skip selected layers
 - `model.weight_sharing`: `true|false`
@@ -216,7 +230,9 @@ Summary saved to `toy_model/runs/arch_combo_summary.json`.
 - `qat.enabled|steps|lr`: short quantization-recovery finetune after main training
 - `distill.enabled|alpha|temperature`: enable teacher-student distillation
 - `distill.hidden_enabled|hidden_weight`: optional TinyBERT-style hidden-state distillation
+- `distill.attn_enabled|attn_weight`: optional attention-map distillation loss
 - `distill.teacher_steps|teacher_lr|teacher_model`: teacher training configuration
+- `mtp.enabled|weight|horizons`: optional multi-token prediction auxiliary loss
 
 ### Hidden Distillation Probe
 
@@ -254,9 +270,101 @@ Compares mixed-bit quantization variants on top of the ALiBi toyfocus baseline.
 
 Summary saved to `toy_model/runs/mixedbit_probe_summary.json`.
 
+### Attention Distillation Probe
+
+```powershell
+python toy_model\run_attn_distill_probe.py
+```
+
+Compares logits-only distillation against logits+attention-map distillation.
+
+Summary saved to `toy_model/runs/attn_distill_probe_summary.json`.
+
+### Sparse 2:4 Packing Probe
+
+```powershell
+python toy_model\run_sparse24_pack_probe.py
+```
+
+Compares baseline vs `nm2_4` pruning and checks sparse-aware payload packing impact.
+
+Summary saved to `toy_model/runs/sparse24_pack_probe_summary.json`.
+
+### Teacher Retune Probe
+
+```powershell
+python toy_model\run_teacher_retune_probe.py
+```
+
+Runs a tiny sweep on teacher strength and distillation temperature around the current best toy config.
+
+Summary saved to `toy_model/runs/teacher_retune_probe_summary.json`.
+
+### Toyfocus Confirmation Probe
+
+```powershell
+python toy_model\run_toyfocus_confirm_probe.py
+```
+
+Runs a tight 4-case confirmation around the current toyfocus best settings.
+
+Summary saved to `toy_model/runs/toyfocus_confirm_probe_summary.json`.
+
+### MTP Probe
+
+```powershell
+python toy_model\run_mtp_probe.py
+```
+
+Compares baseline against multi-token prediction (MTP) auxiliary losses.
+
+Summary saved to `toy_model/runs/mtp_probe_summary.json`.
+
+### Seed Check
+
+```powershell
+python toy_model\run_seed_check.py
+```
+
+Runs a quick 2-seed robustness check on `config_toyfocus_best.yaml`.
+
+Summary saved to `toy_model/runs/seed_check_summary.json`.
+
+### Dual Preset Seed Check
+
+```powershell
+python toy_model\run_dual_preset_seed_check.py
+```
+
+Runs 4-seed comparisons for both quality and compact presets and recommends one.
+
+Summary saved to `toy_model/runs/dual_preset_seed_check_summary.json`.
+
 ## Notes
 
 - This is a toy loop and not the official challenge training setup.
 - Artifact sizing uses compressed packaging of code files plus serialized model payload estimate.
 - `train.py` hard-fails if estimated artifact size exceeds `16 MB`.
 - Toy runs primarily track `val_loss`; official challenge ranking uses `val_bpb` in `train_gpt.py`.
+
+## Scale-Up Workflow (Local)
+
+Build a larger local corpus slice (about 2 MB) from project docs and any cached `data/docs_selected.jsonl` content:
+
+```powershell
+python toy_model\build_local_corpus.py --out data/local_slice_corpus.txt --target-bytes 2000000
+```
+
+Run the desktop scale-up preset:
+
+```powershell
+python toy_model\train.py --config toy_model\config_scaleup_desktop.yaml --run-name scaleup_desktop
+```
+
+Run a quick guardrail comparison (baseline vs scale-up) with budget simulation:
+
+```powershell
+python toy_model\run_scaleup_guardrail.py --steps 50 --max-seconds 25
+```
+
+The guardrail summary is saved to `toy_model/runs/scaleup_guardrail_summary.json`.

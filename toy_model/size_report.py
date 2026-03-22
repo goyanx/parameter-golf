@@ -36,6 +36,7 @@ def estimate_model_bytes(
     quant_fallback_dtype: str = "fp16",
     quant_pack_order: str = "state_dict",
     quant_layer_bits: tuple[tuple[str, int], ...] = (),
+    quant_sparse_2_4_pack: bool = False,
 ) -> int:
     payload = model_payload_bytes(
         model,
@@ -45,6 +46,7 @@ def estimate_model_bytes(
         quant_fallback_dtype=quant_fallback_dtype,
         quant_pack_order=quant_pack_order,
         quant_layer_bits=quant_layer_bits,
+        quant_sparse_2_4_pack=quant_sparse_2_4_pack,
     )
     return len(payload)
 
@@ -57,6 +59,7 @@ def model_payload_bytes(
     quant_fallback_dtype: str = "fp16",
     quant_pack_order: str = "state_dict",
     quant_layer_bits: tuple[tuple[str, int], ...] = (),
+    quant_sparse_2_4_pack: bool = False,
 ) -> bytes:
     if quant_bits is None:
         return _payload_from_state_dict(model.state_dict())
@@ -67,6 +70,7 @@ def model_payload_bytes(
         fallback_dtype=quant_fallback_dtype,
         pack_order=quant_pack_order,
         layer_bits=quant_layer_bits,
+        sparse_2_4_pack=quant_sparse_2_4_pack,
     )
     return _payload_from_quantized_state(model, quant_cfg=qcfg)
 
@@ -80,6 +84,7 @@ def estimate_artifact_bytes(
     quant_fallback_dtype: str = "fp16",
     quant_pack_order: str = "state_dict",
     quant_layer_bits: tuple[tuple[str, int], ...] = (),
+    quant_sparse_2_4_pack: bool = False,
     include_files: list[str] | None = None,
 ) -> int:
     code_dir = Path(code_dir)
@@ -107,6 +112,7 @@ def estimate_artifact_bytes(
                 quant_fallback_dtype=quant_fallback_dtype,
                 quant_pack_order=quant_pack_order,
                 quant_layer_bits=quant_layer_bits,
+                quant_sparse_2_4_pack=quant_sparse_2_4_pack,
             )
             zf.writestr("model_payload.bin", model_payload)
             zf.writestr("model_size_bytes.json", json.dumps({"model_bytes": len(model_payload)}))

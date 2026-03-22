@@ -83,6 +83,35 @@ def structured_prune_model(
     return stats
 
 
+def nm_2_4_prune_model(
+    model: nn.Module,
+    include_patterns: tuple[str, ...] = (),
+    exclude_patterns: tuple[str, ...] = (),
+) -> Dict[str, float]:
+    stats: Dict[str, float] = {}
+    for name, param in model.named_parameters():
+        if not param.requires_grad or param.ndim < 2:
+            continue
+        if not _include_parameter(name, include_patterns, exclude_patterns):
+            continue
+        with torch.no_grad():
+            view = param.detach().reshape(param.shape[0], -1)
+            rows, cols = view.shape
+            cols4 = (cols // 4) * 4
+            if cols4 <= 0:
+                stats[name] = 0.0
+                continue
+            core = view[:, :cols4].reshape(rows, cols4 // 4, 4)
+            keep_idx = torch.topk(core.abs(), k=2, dim=2, largest=True).indices
+            mask = torch.zeros_like(core)
+            mask.scatter_(2, keep_idx, 1.0)
+            core.mul_(mask)
+            view[:, :cols4] = core.reshape(rows, cols4)
+            param.copy_(view.reshape_as(param))
+            stats[name] = 1.0 - float((view != 0).float().mean().item())
+    return stats
+
+
 def global_sparsity(model: nn.Module) -> Tuple[int, int, float]:
     total = 0
     nonzero = 0

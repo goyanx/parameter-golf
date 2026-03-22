@@ -18,6 +18,7 @@ from model import ModelConfig, TinyTransformerLM
 from prune import (
     global_sparsity,
     magnitude_prune_model,
+    nm_2_4_prune_model,
     structured_prune_model,
 )
 from quantize import fake_quantize_model_inplace
@@ -149,6 +150,51 @@ def _distill_loss(
     return loss, ce.detach(), kd.detach()
 
 
+def _mtp_loss(logits: torch.Tensor, targets_next1: torch.Tensor, horizons: tuple[int, ...]) -> torch.Tensor:
+    losses = []
+    for h in horizons:
+        if h <= 1:
+            continue
+        shift = h - 1
+        if shift >= logits.size(1):
+            continue
+        pred = logits[:, :-shift, :]
+        tgt = targets_next1[:, shift:]
+        losses.append(F.cross_entropy(pred.reshape(-1, pred.size(-1)), tgt.reshape(-1)))
+    if not losses:
+        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+    return torch.stack(losses).mean()
+
+
+def _align_head_dim(attn: torch.Tensor, target_heads: int) -> torch.Tensor:
+    heads = int(attn.size(1))
+    if heads == target_heads:
+        return attn
+    if heads > target_heads:
+        group = max(1, heads // target_heads)
+        usable = target_heads * group
+        attn = attn[:, :usable]
+        return attn.view(attn.size(0), target_heads, group, attn.size(2), attn.size(3)).mean(dim=2)
+    repeat = max(1, target_heads // heads)
+    expanded = attn.repeat_interleave(repeat, dim=1)
+    return expanded[:, :target_heads]
+
+
+def _attention_distill_loss(student_maps, teacher_maps) -> torch.Tensor:
+    if not student_maps or not teacher_maps:
+        return torch.tensor(0.0)
+    n = min(len(student_maps), len(teacher_maps))
+    losses = []
+    for i in range(n):
+        s = student_maps[i]
+        t = teacher_maps[i].detach()
+        t = _align_head_dim(t, target_heads=int(s.size(1)))
+        losses.append(F.mse_loss(s, t))
+    if not losses:
+        return torch.tensor(0.0)
+    return torch.stack(losses).mean()
+
+
 def _interp_linear(start: float, end: float, step: int, total_steps: int) -> float:
     if total_steps <= 1:
         return end
@@ -184,12 +230,19 @@ def main() -> None:
     steps = int(cfg["train"]["steps"])
     eval_every = int(cfg["train"].get("eval_every", 50))
     eval_steps = int(cfg["train"].get("eval_steps", 10))
+    time_budget_raw = cfg["train"].get("time_budget_sec")
+    time_budget_sec = float(time_budget_raw) if time_budget_raw is not None else None
+    stop_on_budget = bool(cfg["train"].get("stop_on_budget", True))
+    budget_check_every = max(1, int(cfg["train"].get("budget_check_every", 5)))
+    overall_start = time.perf_counter()
+    budget_hit = False
     quant_bits = cfg.get("quantize", {}).get("bits")
     quant_group_size = int(cfg.get("quantize", {}).get("group_size", 64))
     quant_exclude_patterns = _to_patterns(cfg.get("quantize", {}).get("exclude_patterns", []))
     quant_fallback_dtype = str(cfg.get("quantize", {}).get("fallback_dtype", "fp16"))
     quant_pack_order = str(cfg.get("quantize", {}).get("pack_order", "state_dict"))
     quant_layer_bits = _to_layer_bits(cfg.get("quantize", {}).get("layer_bits", {}))
+    quant_sparse_2_4_pack = bool(cfg.get("quantize", {}).get("sparse_2_4_pack", False))
     distill_cfg = cfg.get("distill", {})
     distill_enabled = bool(distill_cfg.get("enabled", False))
     distill_alpha = float(distill_cfg.get("alpha", 0.5))
@@ -199,7 +252,13 @@ def main() -> None:
     distill_temp = float(distill_cfg.get("temperature", 2.0))
     distill_hidden_enabled = bool(distill_cfg.get("hidden_enabled", False))
     distill_hidden_weight = float(distill_cfg.get("hidden_weight", 0.1))
+    distill_attn_enabled = bool(distill_cfg.get("attn_enabled", False))
+    distill_attn_weight = float(distill_cfg.get("attn_weight", 0.05))
     teacher_steps = int(distill_cfg.get("teacher_steps", 0))
+    mtp_cfg = cfg.get("mtp", {})
+    mtp_enabled = bool(mtp_cfg.get("enabled", False))
+    mtp_weight = float(mtp_cfg.get("weight", 0.1))
+    mtp_horizons = tuple(int(x) for x in mtp_cfg.get("horizons", [2]) if int(x) > 1)
     grad_clip = float(cfg["train"].get("grad_clip", 0.0))
 
     prune_cfg = cfg.get("prune", {})
@@ -212,6 +271,7 @@ def main() -> None:
     progressive_prune_end = int(prune_cfg.get("end_step", steps))
     progressive_prune_every = int(prune_cfg.get("every", 25))
     applied_prune_target = 0.0
+    defer_nm_prune = prune_mode == "nm2_4"
 
     teacher_model: Optional[TinyTransformerLM] = None
     hidden_projector: Optional[torch.nn.Module] = None
@@ -231,6 +291,10 @@ def main() -> None:
             teacher_opt.zero_grad(set_to_none=True)
             tloss.backward()
             teacher_opt.step()
+            if time_budget_sec is not None and stop_on_budget and tstep % budget_check_every == 0:
+                if (time.perf_counter() - overall_start) >= time_budget_sec:
+                    budget_hit = True
+                    break
             if eval_every > 0 and tstep % eval_every == 0:
                 tval = eval_loss(teacher_model, splits["val"], batch_size, seq_len, eval_steps, device)
                 print(f"[{args.run_name}] teacher_step={tstep} teacher_loss={tloss.item():.4f} teacher_val={tval:.4f}")
@@ -243,20 +307,41 @@ def main() -> None:
             opt.add_param_group({"params": hidden_projector.parameters()})
 
     start = time.perf_counter()
+    executed_steps = 0
+    projected_full_train_time_sec = 0.0
     for step in range(1, steps + 1):
+        if time_budget_sec is not None and stop_on_budget and step % budget_check_every == 1:
+            elapsed = time.perf_counter() - overall_start
+            if elapsed >= time_budget_sec:
+                budget_hit = True
+                break
         xb, yb = get_batch(splits["train"], batch_size, seq_len, device)
-        if distill_enabled and distill_hidden_enabled:
-            slogits, ce_loss, shid = model(xb, yb, return_hidden=True)
+        if distill_enabled and distill_hidden_enabled and distill_attn_enabled:
+            slogits, ce_loss, shid, sattn = model(xb, yb, return_hidden=True, return_attn=True)
+        elif distill_enabled and distill_hidden_enabled:
+            slogits, ce_loss, shid = model(xb, yb, return_hidden=True, return_attn=False)
+            sattn = None
+        elif distill_enabled and distill_attn_enabled:
+            slogits, ce_loss, sattn = model(xb, yb, return_hidden=False, return_attn=True)
+            shid = None
         else:
             slogits, ce_loss = model(xb, yb)
             shid = None
+            sattn = None
         if distill_enabled and teacher_model is not None:
             with torch.no_grad():
-                if distill_hidden_enabled:
-                    tlogits, _, thid = teacher_model(xb, None, return_hidden=True)
+                if distill_hidden_enabled and distill_attn_enabled:
+                    tlogits, _, thid, tattn = teacher_model(xb, None, return_hidden=True, return_attn=True)
+                elif distill_hidden_enabled:
+                    tlogits, _, thid = teacher_model(xb, None, return_hidden=True, return_attn=False)
+                    tattn = None
+                elif distill_attn_enabled:
+                    tlogits, _, tattn = teacher_model(xb, None, return_hidden=False, return_attn=True)
+                    thid = None
                 else:
                     tlogits, _ = teacher_model(xb, None)
                     thid = None
+                    tattn = None
             if distill_schedule == "linear":
                 alpha_t = _interp_linear(distill_alpha_start, distill_alpha_end, step, steps)
             else:
@@ -276,15 +361,26 @@ def main() -> None:
                     t_h = hidden_projector(t_h)
                 hidden_loss = F.mse_loss(s_h, t_h)
                 loss = loss + distill_hidden_weight * hidden_loss
+            if distill_attn_enabled:
+                assert sattn is not None and tattn is not None
+                attn_loss = _attention_distill_loss(sattn, tattn).to(device=device, dtype=loss.dtype)
+                loss = loss + distill_attn_weight * attn_loss
         else:
             loss = ce_loss
+        if mtp_enabled and mtp_horizons:
+            mtp = _mtp_loss(slogits, yb, mtp_horizons)
+            loss = loss + mtp_weight * mtp
         opt.zero_grad(set_to_none=True)
         loss.backward()
         if grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
         opt.step()
+        executed_steps = step
+        elapsed_main = time.perf_counter() - start
+        projected_full_train_time_sec = (elapsed_main / float(step)) * float(steps)
+        elapsed = time.perf_counter() - overall_start
 
-        if progressive_prune_enabled and prune_amount > 0 and step >= progressive_prune_start:
+        if (not defer_nm_prune) and progressive_prune_enabled and prune_amount > 0 and step >= progressive_prune_start:
             if step % max(1, progressive_prune_every) == 0:
                 span = max(1, progressive_prune_end - progressive_prune_start + 1)
                 rel_step = min(span, step - progressive_prune_start + 1)
@@ -309,8 +405,13 @@ def main() -> None:
             val = eval_loss(model, splits["val"], batch_size, seq_len, eval_steps, device)
             print(f"[{args.run_name}] step={step} train_loss={loss.item():.4f} val_loss={val:.4f}")
 
+        if time_budget_sec is not None and stop_on_budget and step % budget_check_every == 0:
+            if elapsed >= time_budget_sec:
+                budget_hit = True
+                break
+
     prune_stats = {}
-    if prune_amount > 0 and not progressive_prune_enabled:
+    if prune_amount > 0 and not progressive_prune_enabled and not defer_nm_prune:
         if prune_mode == "magnitude":
             prune_stats = magnitude_prune_model(model, amount=prune_amount)
         else:
@@ -321,7 +422,7 @@ def main() -> None:
                 include_patterns=prune_include_patterns,
                 exclude_patterns=prune_exclude_patterns,
             )
-    elif prune_amount > 0 and progressive_prune_enabled:
+    elif prune_amount > 0 and progressive_prune_enabled and not defer_nm_prune:
         # Collect layer stats with a no-op prune call.
         if prune_mode == "magnitude":
             prune_stats = {k: v for k, v in magnitude_prune_model(model, amount=0.0).items()}
@@ -361,8 +462,19 @@ def main() -> None:
             if qat_grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=qat_grad_clip)
             qat_opt.step()
+            if time_budget_sec is not None and stop_on_budget and qstep % budget_check_every == 0:
+                if (time.perf_counter() - overall_start) >= time_budget_sec:
+                    budget_hit = True
+                    break
 
-    train_time = time.perf_counter() - start
+    if defer_nm_prune:
+        prune_stats = nm_2_4_prune_model(
+            model,
+            include_patterns=prune_include_patterns,
+            exclude_patterns=prune_exclude_patterns,
+        )
+
+    train_time = time.perf_counter() - overall_start
     val_loss = eval_loss(model, splits["val"], batch_size, seq_len, eval_steps, device)
 
     artifact_bytes = estimate_artifact_bytes(
@@ -374,6 +486,7 @@ def main() -> None:
         quant_fallback_dtype=quant_fallback_dtype,
         quant_pack_order=quant_pack_order,
         quant_layer_bits=quant_layer_bits,
+        quant_sparse_2_4_pack=quant_sparse_2_4_pack,
     )
     params = parameter_count(model)
     nonzero, total, sparsity = global_sparsity(model)
@@ -389,6 +502,8 @@ def main() -> None:
 
     metrics = {
         "run_name": args.run_name,
+        "planned_steps": steps,
+        "executed_steps": executed_steps,
         "parameter_count": params,
         "nonzero_parameters": nonzero,
         "total_parameters": total,
@@ -408,6 +523,7 @@ def main() -> None:
         "quant_exclude_patterns": list(quant_exclude_patterns),
         "quant_pack_order": quant_pack_order,
         "quant_layer_bits": [{"pattern": p, "bits": b} for p, b in quant_layer_bits],
+        "quant_sparse_2_4_pack": quant_sparse_2_4_pack,
         "distill_enabled": distill_enabled,
         "distill_alpha": distill_alpha,
         "distill_alpha_start": distill_alpha_start,
@@ -416,6 +532,11 @@ def main() -> None:
         "distill_temperature": distill_temp,
         "distill_hidden_enabled": distill_hidden_enabled,
         "distill_hidden_weight": distill_hidden_weight,
+        "distill_attn_enabled": distill_attn_enabled,
+        "distill_attn_weight": distill_attn_weight,
+        "mtp_enabled": mtp_enabled,
+        "mtp_weight": mtp_weight,
+        "mtp_horizons": list(mtp_horizons),
         "teacher_steps": teacher_steps,
         "grad_clip": grad_clip,
         "progressive_prune_enabled": progressive_prune_enabled,
@@ -424,6 +545,9 @@ def main() -> None:
         "qat_steps": qat_steps,
         "qat_delay_fake_quant_steps": qat_delay_fake_quant_steps,
         "qat_grad_clip": qat_grad_clip,
+        "time_budget_sec": time_budget_sec,
+        "time_budget_hit": budget_hit,
+        "projected_full_train_time_sec": projected_full_train_time_sec,
         "device": str(device),
     }
 
@@ -436,3 +560,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

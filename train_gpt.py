@@ -51,6 +51,16 @@ def _apply_compression_preset() -> str:
             "QAT_INT8_ENABLED": "1",
             "QAT_INT8_EVERY": "1",
         },
+        "toy_promoted": {
+            "PRUNE_AMOUNT": "0.11",
+            "PRUNE_PROGRESSIVE": "1",
+            "PRUNE_EVERY": "25",
+            "QAT_INT8_ENABLED": "1",
+            "QAT_INT8_EVERY": "1",
+            "MTP_ENABLED": "1",
+            "MTP_WEIGHT": "0.10",
+            "MTP_HORIZONS": "2,3",
+        },
     }
     if preset not in presets:
         raise ValueError(f"Unknown COMPRESSION_PRESET={preset!r}")
@@ -163,6 +173,13 @@ class Hyperparameters:
         p.strip()
         for p in os.environ.get("QAT_INT8_EXCLUDE", "tok_emb,lm_head,final_norm,skip_weights").split(",")
         if p.strip()
+    )
+    mtp_enabled = bool(int(os.environ.get("MTP_ENABLED", "0")))
+    mtp_weight = float(os.environ.get("MTP_WEIGHT", 0.10))
+    mtp_horizons = tuple(
+        int(x.strip())
+        for x in os.environ.get("MTP_HORIZONS", "2").split(",")
+        if x.strip() and int(x.strip()) > 1
     )
 
 # -----------------------------
@@ -790,6 +807,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mtp_enabled: bool = False,
+        mtp_weight: float = 0.1,
+        mtp_horizons: tuple[int, ...] = (2,),
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -797,6 +817,9 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.mtp_enabled = mtp_enabled
+        self.mtp_weight = mtp_weight
+        self.mtp_horizons = tuple(h for h in mtp_horizons if h > 1)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -843,8 +866,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -852,7 +874,22 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
+        if not self.mtp_enabled or not self.mtp_horizons:
+            return ce
+
+        mtp_losses: list[Tensor] = []
+        for h in self.mtp_horizons:
+            shift = h - 1
+            if shift >= logits.size(1):
+                continue
+            pred = logits[:, :-shift, :]
+            tgt = target_ids[:, shift:]
+            mtp_losses.append(F.cross_entropy(pred.reshape(-1, pred.size(-1)).float(), tgt.reshape(-1), reduction="mean"))
+        if not mtp_losses:
+            return ce
+        mtp = torch.stack(mtp_losses).mean()
+        return ce + self.mtp_weight * mtp
 
 
 # -----------------------------
@@ -966,6 +1003,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mtp_enabled=args.mtp_enabled,
+        mtp_weight=args.mtp_weight,
+        mtp_horizons=args.mtp_horizons,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1046,7 +1086,8 @@ def main() -> None:
         f"prune_start:{prune_start_step} prune_end:{prune_end_step} prune_every:{args.prune_every} "
         f"qat_int8_enabled:{args.qat_int8_enabled} qat_int8_start:{qat_int8_start_step} "
         f"qat_int8_every:{args.qat_int8_every} experiment_preset:{args.experiment_preset or 'none'} "
-        f"compression_preset:{args.compression_preset or 'none'}"
+        f"compression_preset:{args.compression_preset or 'none'} "
+        f"mtp_enabled:{args.mtp_enabled} mtp_weight:{args.mtp_weight} mtp_horizons:{list(args.mtp_horizons)}"
     )
     log0(f"seed:{args.seed}")
 

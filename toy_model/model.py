@@ -65,7 +65,13 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor, alibi_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        alibi_bias: Optional[torch.Tensor] = None,
+        return_attn: bool = False,
+    ):
         b, t, c = x.shape
         kv_width = self.kv_heads * self.head_dim
         qkv = self.qkv(x)
@@ -90,7 +96,10 @@ class CausalSelfAttention(nn.Module):
 
         out = att @ v
         out = out.transpose(1, 2).contiguous().view(b, t, c)
-        return self.proj(out)
+        out = self.proj(out)
+        if return_attn:
+            return out, att
+        return out
 
 
 class MLP(nn.Module):
@@ -127,9 +136,22 @@ class TransformerBlock(nn.Module):
         self.ln2 = nn.LayerNorm(d_model)
         self.mlp = MLP(d_model, dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor, alibi_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), attn_mask, alibi_bias=alibi_bias)
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        alibi_bias: Optional[torch.Tensor] = None,
+        return_attn: bool = False,
+    ):
+        if return_attn:
+            attn_out, attn_probs = self.attn(self.ln1(x), attn_mask, alibi_bias=alibi_bias, return_attn=True)
+        else:
+            attn_out = self.attn(self.ln1(x), attn_mask, alibi_bias=alibi_bias)
+            attn_probs = None
+        x = x + attn_out
         x = x + self.mlp(self.ln2(x))
+        if return_attn:
+            return x, attn_probs
         return x
 
 
@@ -184,7 +206,13 @@ class TinyTransformerLM(nn.Module):
         rel = rel.clamp_max(0.0)
         return rel * slopes
 
-    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None, return_hidden: bool = False):
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
+        return_attn: bool = False,
+    ):
         b, t = idx.shape
         if t > self.cfg.max_seq_len:
             raise ValueError(f"Input length {t} exceeds max_seq_len={self.cfg.max_seq_len}")
@@ -196,15 +224,26 @@ class TinyTransformerLM(nn.Module):
         x = self.drop(x)
         mask = self._attn_mask(t, idx.device)
         alibi_bias = self._alibi_bias(t, idx.device)
+        attn_maps = [] if return_attn else None
 
         if self.cfg.weight_sharing:
             assert self.shared_block is not None
             for _ in range(self.cfg.n_layers):
-                x = self.shared_block(x, mask, alibi_bias=alibi_bias)
+                if return_attn:
+                    x, a = self.shared_block(x, mask, alibi_bias=alibi_bias, return_attn=True)
+                    assert attn_maps is not None
+                    attn_maps.append(a)
+                else:
+                    x = self.shared_block(x, mask, alibi_bias=alibi_bias)
         else:
             assert self.blocks is not None
             for blk in self.blocks:
-                x = blk(x, mask, alibi_bias=alibi_bias)
+                if return_attn:
+                    x, a = blk(x, mask, alibi_bias=alibi_bias, return_attn=True)
+                    assert attn_maps is not None
+                    attn_maps.append(a)
+                else:
+                    x = blk(x, mask, alibi_bias=alibi_bias)
 
         x = self.ln_f(x)
         hidden = x
@@ -213,6 +252,10 @@ class TinyTransformerLM(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        if return_hidden and return_attn:
+            return logits, loss, hidden, attn_maps
         if return_hidden:
             return logits, loss, hidden
+        if return_attn:
+            return logits, loss, attn_maps
         return logits, loss

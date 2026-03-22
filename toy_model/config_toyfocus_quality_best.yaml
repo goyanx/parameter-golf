@@ -10,7 +10,8 @@ model:
   max_seq_len: 64
   dropout: 0.0
   weight_sharing: true
-  positional_encoding: learned
+  attn_kv_heads: 1
+  positional_encoding: alibi
 
 train:
   seed: 1337
@@ -20,10 +21,11 @@ train:
   steps: 200
   eval_every: 50
   eval_steps: 8
+  grad_clip: 0.8
 
 quantize:
   bits: 4
-  group_size: 64
+  group_size: 40
   exclude_patterns:
     - token_emb
     - head
@@ -34,30 +36,39 @@ quantize:
   sparse_2_4_pack: false
 
 prune:
-  amount: 0.1
+  amount: 0.12
+  progressive: true
+  start_step: 100
+  end_step: 200
+  every: 25
 
 lowrank:
-  rank: null
+  rank: 56
 
 qat:
   enabled: true
-  steps: 60
+  steps: 90
   lr: 0.0002
+  grad_clip: 0.8
+  delay_fake_quant_steps: 20
 
 distill:
   enabled: true
   alpha: 0.35
-  temperature: 2.5
+  alpha_start: 0.5
+  alpha_end: 0.25
+  alpha_schedule: linear
+  temperature: 2.0
   hidden_enabled: false
   hidden_weight: 0.1
-  attn_enabled: false
-  attn_weight: 0.05
-  teacher_steps: 160
+  attn_enabled: true
+  attn_weight: 0.02
+  teacher_steps: 200
   teacher_lr: 0.001
   teacher_model:
-    d_model: 192
-    n_heads: 6
-    n_layers: 3
+    d_model: 256
+    n_heads: 8
+    n_layers: 4
     max_seq_len: 64
     dropout: 0.0
     weight_sharing: false

@@ -100,6 +100,49 @@
   - Best compact (`quantize.bits=3`): `~0.1445 MB`, loss `~2.3883`
   - Delta vs int4 baseline: `-0.0127 MB`, `+0.0029` loss
   - Decision: keep mixed-bit capability and add compact preset `config_toyfocus_mixedbit_compact.yaml`
+- Attention-map distillation probe (`run_attn_distill_probe.py`):
+  - Added attention-map MSE loss between teacher/student attention probabilities
+  - Baseline logits-only: `~0.1579 MB`, loss `~2.3854`
+  - `attn_weight=0.02`: `~0.1572 MB`, loss `~2.3734`
+  - `attn_weight=0.05`: `~0.1581 MB`, loss `~2.3838`
+  - Decision: keep attention-map distillation with `attn_weight=0.02` and promote to `config_toyfocus_best.yaml`
+- Sparse 2:4 packing probe (`run_sparse24_pack_probe.py`):
+  - Added `prune.mode=nm2_4` and sparse-aware packing (`quantize.sparse_2_4_pack`)
+  - Aggressive `attn+mlp` 2:4 + pack:
+    - `~0.1301 MB`, loss `~3.0178` (too lossy)
+  - Milder `attn-only` 2:4 + pack:
+    - `~0.1495 MB`, loss `~2.4053`
+  - Decision: keep feature support, but do not promote as default (current ALiBi branches still better frontier)
+- Teacher/temperature micro-retune (`run_teacher_retune_probe.py`):
+  - Baseline (`teacher_steps=240`, `temp=2.2`): `~0.1581 MB`, loss `~2.3734`
+  - Quality winner (`teacher_steps=200`, `temp=2.0`): `~0.1592 MB`, loss `~2.2548`
+  - Balanced winner (`teacher_steps=280`, `temp=2.0`): `~0.1523 MB`, loss `~2.3452`
+  - Decision:
+    - Promote balanced winner to `config_toyfocus_best.yaml`
+    - Save quality winner as `config_toyfocus_quality_best.yaml`
+- Tight confirmation around toyfocus best (`run_toyfocus_confirm_probe.py`):
+  - Confirmed settings around `(teacher_steps~280, temp~2.0)` with 4 runs
+  - New best confirmed default:
+    - `teacher_steps=300`, `temperature=2.0`
+    - `~0.1525 MB`, loss `~2.2995`
+  - Decision: promote this to `config_toyfocus_best.yaml`
+- Multi-token prediction probe (`run_mtp_probe.py`):
+  - Added auxiliary MTP loss (`mtp.enabled`, `mtp.weight`, `mtp.horizons`)
+  - Baseline (no MTP): `~0.1528 MB`, loss `~2.2995`
+  - `horizons=[2], weight=0.10`: `~0.1541 MB`, loss `~2.3274` (worse)
+  - `horizons=[2], weight=0.20`: `~0.1532 MB`, loss `~2.3447` (worse)
+  - `horizons=[2,3], weight=0.10`: `~0.1517 MB`, loss `~2.2887` (best)
+  - Decision: keep MTP with `horizons=[2,3]`, `weight=0.10` and promote to `config_toyfocus_best.yaml`
+- Dual preset 4-seed check (`run_dual_preset_seed_check.py`):
+  - Compared 4 seeds for `quality` vs `compact` presets
+  - Quality stats:
+    - mean loss `~2.1837`, stdev `~0.0624`
+    - mean size `~0.1558 MB`, stdev `~0.0026`
+  - Compact stats:
+    - mean loss `~2.2318`, stdev `~0.0937`
+    - mean size `~0.1463 MB`, stdev `~0.0011`
+  - Recommendation: keep `quality` preset as primary, keep `compact` as secondary size mode
+  - Decision on new algorithms: no immediate new algorithm needed; focus next on promotion to real pipeline
 - RunPod real-pipeline reference (non-toy, `train_gpt.py`, 1xH100, 10-minute cap):
   - stop step: `1133`
   - final exact: `val_loss=2.27510323`, `val_bpb=1.34744428`
@@ -108,16 +151,17 @@
 
 ## In Progress
 
-- `toyfocus + ALiBi` is now the primary compact-quality branch (`~0.1563 MB / ~2.3854`).
+- `toyfocus + ALiBi + light attention distillation + MTP` is now the primary compact-quality branch (`~0.1517 MB / ~2.2887`).
 - `toyfocus + ALiBi + int3` is the compact-size branch (`~0.1445 MB / ~2.3883`).
+- Quality-max branch:
+  - `~0.1592 MB / ~2.2548`
 - No-go branches cleaned from active toy code:
   - Wanda pruning path removed
   - AWQ-lite channel protection removed
   - MLA latent KV path removed
 - Current coding shortlist:
-  - compare `train_gpt.py` baseline vs `COMPRESSION_PRESET=toy_micro_best` on short smoke run
-  - keep toy exploration only for materially new mechanisms (not plateaued knobs)
-  - next research axes from shortlist: `#2` attention-map distillation or `#3` 2:4 structured sparsity
+  - compare `train_gpt.py` baseline vs promoted toy stack on short smoke run
+  - keep toy exploration paused unless real-pipeline transfer reveals a gap
 
 ## Yet To Try
 
@@ -150,7 +194,7 @@
 ## Objective Check
 
 - Current best near-size:
-  - `~0.1563 MB`, loss `~2.385`
+  - `~0.1517 MB`, loss `~2.289`
 - Current best compact-size:
   - `~0.1445 MB`, loss `~2.388`
 - Structured best:
@@ -166,3 +210,10 @@
 - The best remaining toy-model direction is still structured pruning first, packing order second.
 - The best architecture knob so far is grouped-query attention with `attn_kv_heads=2`.
 - The best combined architecture/compression point is `attn_kv_heads=2` plus attention-row pruning at `0.08`.
+- Scale-up dataset + budget guardrail (`build_local_corpus.py`, `config_scaleup_desktop.yaml`, `run_scaleup_guardrail.py`):
+  - Built `toy_model/data/local_slice_corpus.txt` to ~2.0 MB from local docs/docs-cache when available
+  - Added timing budget simulation in `train.py` (`train.time_budget_sec`, `stop_on_budget`, `budget_check_every`)
+  - Quick guardrail run (`steps=50`, `max_seconds=25`):
+    - baseline: `~1.5613 MB`, `val_loss~3.4248`, `time_budget_hit=false`
+    - scale-up: `~0.8036 MB`, `val_loss~3.4956`, `time_budget_hit=true`
+  - Outcome: larger model + compression remains well under artifact cap, and budget stop now applies across main training and QAT.

@@ -904,3 +904,245 @@ Learnings:
 
 Next:
 - Move to next high-upside mechanism: attention-map distillation (`#2`) or 2:4 sparsity with sparse-aware packing (`#3`).
+
+## 2026-03-20 - Attention-map distillation probe on ALiBi baseline (paper idea #2)
+
+Context:
+- Implemented teacher-student attention-map distillation to replace the earlier no-go hidden-state distillation path.
+
+Changes:
+- Files changed:
+  - `toy_model/model.py`: optional return of per-layer attention probabilities
+  - `toy_model/train.py`: added attention distillation (`distill.attn_enabled`, `distill.attn_weight`) with teacher/student head-alignment
+  - `toy_model/config.yaml`, `toy_model/config_distill_qat.yaml`, `toy_model/config_toyfocus_best.yaml`, `toy_model/config_toyfocus_mixedbit_compact.yaml`
+  - `toy_model/run_attn_distill_probe.py`
+
+Results:
+- Probe summary: `toy_model/runs/attn_distill_probe_summary.json`
+- Baseline logits-only:
+  - artifact_size_mb: `0.157887`
+  - val_loss: `2.385367`
+- Attention distill `attn_weight=0.02`:
+  - artifact_size_mb: `0.157223`
+  - val_loss: `2.373386`
+  - delta vs base: `-0.000665 MB`, `-0.011981 loss`
+- Attention distill `attn_weight=0.05`:
+  - artifact_size_mb: `0.158058`
+  - val_loss: `2.383788`
+  - delta vs base: `+0.000171 MB`, `-0.001578 loss`
+
+Decision:
+- Keep attention-map distillation at `attn_weight=0.02`.
+- Promote it into `config_toyfocus_best.yaml`.
+
+Learnings:
+- Attention-map supervision is materially better than hidden-state MSE for this compact toy model.
+- A light attention loss gives the best tradeoff; heavier weight trends toward diminishing returns.
+
+Next:
+- Implement and test `#3`: 2:4 structured sparsity with sparse-aware packing.
+
+## 2026-03-21 - 2:4 pruning plus sparse-aware payload packing (paper idea #3)
+
+Context:
+- Implemented and evaluated 2:4 structured pruning with custom sparse payload encoding.
+
+Changes:
+- Files changed:
+  - `toy_model/prune.py`: added deterministic `nm_2_4_prune_model`
+  - `toy_model/train.py`: supports `prune.mode=nm2_4` and deferred 2:4 prune after QAT loop
+  - `toy_model/quantize.py`: added sparse 2:4 payload packing path (`quantize.sparse_2_4_pack`)
+  - `toy_model/size_report.py`: plumbed sparse pack knob
+  - `toy_model/run_sparse24_pack_probe.py`
+- Config knobs:
+  - `prune.mode=nm2_4`
+  - `quantize.sparse_2_4_pack=true|false`
+
+Results:
+- Probe summary: `toy_model/runs/sparse24_pack_probe_summary.json`
+- Baseline (`alibi + attn_distill + int4`):
+  - artifact_size_mb: `0.158091`
+  - val_loss: `2.373386`
+- 2:4 (`attn+mlp`) with sparse packing:
+  - artifact_size_mb: `0.130073`
+  - val_loss: `3.017763`
+- 2:4 (`attn-only`) with sparse packing:
+  - artifact_size_mb: `0.149537`
+  - val_loss: `2.405295`
+
+Decision:
+- Keep sparse 2:4 capability in code.
+- Do not promote as default branch (current ALiBi + int3 / attn-distill branches remain better quality-size frontier).
+
+Learnings:
+- Sparse packing itself works and gives meaningful byte reduction once a strict 2:4 mask is present.
+- Quality degradation from enforced 2:4, especially on broad layer sets, is the limiting factor.
+
+Next:
+- Return to lighter knobs on current best stack (teacher/temperature micro-retune).
+
+## 2026-03-21 - Tiny teacher/temperature retune on current best stack
+
+Context:
+- Ran a minimal sweep around current ALiBi + attention-distill baseline to capture cheap quality gains.
+
+Changes:
+- Added `toy_model/run_teacher_retune_probe.py`
+- Tuned only:
+  - `distill.teacher_steps in {200,240,280}`
+  - `distill.temperature in {2.0,2.2,2.4}`
+- Added new preset:
+  - `toy_model/config_toyfocus_quality_best.yaml`
+- Updated:
+  - `toy_model/config_toyfocus_best.yaml` to balanced winner
+
+Results:
+- Probe summary: `toy_model/runs/teacher_retune_probe_summary.json`
+- Baseline (`240`, `2.2`):
+  - artifact_size_mb: `0.158091`
+  - val_loss: `2.373386`
+- Quality winner (`200`, `2.0`):
+  - artifact_size_mb: `0.1592`
+  - val_loss: `2.2548`
+- Balanced winner (`280`, `2.0`):
+  - artifact_size_mb: `0.1523`
+  - val_loss: `2.3452`
+
+Decision:
+- Promote balanced winner to default `config_toyfocus_best.yaml`.
+- Keep quality-max variant as `config_toyfocus_quality_best.yaml`.
+
+Learnings:
+- Small distillation schedule tweaks still move the frontier materially.
+- The `temp=2.0` branch dominated `2.2/2.4` in this local toy setting.
+
+Next:
+- If staying toy-only, run a very tight 4-case confirmation around the new balanced winner.
+
+## 2026-03-21 - Tight confirmation sweep on toyfocus best
+
+Context:
+- Ran the recommended 4-case confirmation around the newly promoted balanced preset.
+
+Changes:
+- Added `toy_model/run_toyfocus_confirm_probe.py`
+- Swept:
+  - `teacher_steps in {260,280,300}`
+  - `temperature in {1.9,2.0}`
+- Updated default:
+  - `toy_model/config_toyfocus_best.yaml` now uses `teacher_steps=300`, `temperature=2.0`
+
+Results:
+- Summary: `toy_model/runs/toyfocus_confirm_probe_summary.json`
+- Prior baseline (`280`, `2.0`):
+  - artifact_size_mb: `0.1529`
+  - val_loss: `2.3452`
+- New best (`300`, `2.0`):
+  - artifact_size_mb: `0.1525`
+  - val_loss: `2.2995`
+  - delta vs baseline: `-0.0004 MB`, `-0.0457 loss`
+
+Decision:
+- Keep and promote `teacher_steps=300`, `temperature=2.0` as current default toyfocus best.
+
+Learnings:
+- The 2.0 temperature branch remains strongest.
+- Slightly stronger teacher (`300`) still improves quality without size penalty.
+
+Next:
+- If we continue toy-only, run one small seed-variance check (2 seeds) for this exact config.
+
+## 2026-03-21 - Multi-token prediction (MTP) integration and probe
+
+Context:
+- Implemented MTP auxiliary loss to test DeepSeek-style multi-token prediction benefits on toyfocus best.
+
+Changes:
+- Files changed:
+  - `toy_model/train.py`: added `mtp` config path and auxiliary loss computation
+  - `toy_model/config*.yaml`: added `mtp.enabled`, `mtp.weight`, `mtp.horizons`
+  - `toy_model/run_mtp_probe.py`
+- Promoted config:
+  - `toy_model/config_toyfocus_best.yaml` now uses `mtp.enabled=true`, `mtp.horizons=[2,3]`, `mtp.weight=0.1`
+
+Results:
+- Summary: `toy_model/runs/mtp_probe_summary.json`
+- Baseline (MTP off):
+  - artifact_size_mb: `0.1528`
+  - val_loss: `2.2995`
+- Best MTP (`horizons=[2,3]`, `weight=0.1`):
+  - artifact_size_mb: `0.1517`
+  - val_loss: `2.2887`
+  - delta vs baseline: `-0.0011 MB`, `-0.0108 loss`
+
+Decision:
+- Keep MTP in default toyfocus best config.
+
+Learnings:
+- Single-horizon MTP (`[2]`) was harmful in this setup.
+- Multi-horizon supervision (`[2,3]`) provided a small but real frontier gain.
+
+Next:
+- Optional: run 2-seed robustness check on the new default config.
+
+## 2026-03-21 - 4-seed dual-preset robustness decision
+
+Context:
+- Needed to decide whether to keep searching new toy algorithms or lock the stack and promote.
+
+Changes:
+- Added `toy_model/run_dual_preset_seed_check.py`
+- Compared:
+  - `quality` preset (`config_toyfocus_best.yaml`)
+  - `compact` preset (`config_toyfocus_mixedbit_compact.yaml`)
+- Seeds: `1337, 2027, 3141, 4242`
+
+Results:
+- Summary: `toy_model/runs/dual_preset_seed_check_summary.json`
+- Quality:
+  - mean loss: `2.1837`, stdev: `0.0624`
+  - mean size: `0.1558 MB`, stdev: `0.0026`
+- Compact:
+  - mean loss: `2.2318`, stdev: `0.0937`
+  - mean size: `0.1463 MB`, stdev: `0.0011`
+- Auto-recommendation: `quality`
+
+Decision:
+- Keep `quality` preset as default.
+- Keep `compact` as optional size-first mode.
+- Do not add more toy algorithms immediately; move effort to real-pipeline promotion/A-B validation.
+
+Learnings:
+- Quality preset has better average loss and better stability in this 4-seed check.
+- Compact preset remains useful when byte pressure dominates.
+
+Next:
+- Port the proven toy stack knobs to `train_gpt.py` and run short baseline-vs-promoted A/B.
+
+## 2026-03-21 - Toy scale-up workflow + budget guardrail
+
+Context:
+- Closed remaining scale-up checklist items by moving toy runs beyond tiny corpus and enforcing tighter runtime iteration limits.
+
+Changes:
+- Files changed: `toy_model/build_local_corpus.py`, `toy_model/config_scaleup_desktop.yaml`, `toy_model/run_scaleup_guardrail.py`, `toy_model/train.py`, `toy_model/README.md`, `toy_model/EXPERIMENT_TRACKER.md`, `checklist.md`.
+- Config knobs:
+  - New `train.time_budget_sec`, `train.stop_on_budget`, `train.budget_check_every`
+  - New scale-up preset with larger model (`d_model=256`, `n_layers=4`, `max_seq_len=128`) and compression path.
+
+Results:
+- Built larger local corpus: `toy_model/data/local_slice_corpus.txt` (`~2,000,139` bytes).
+- Guardrail run (`steps=50`, `max_seconds=25`, `.venv_pg`):
+  - `guard_base`: `artifact_size_mb=1.5613`, `val_loss=3.4248`, `train_time_sec=1.2569`, `time_budget_hit=false`
+  - `guard_scaleup`: `artifact_size_mb=0.8036`, `val_loss=3.4956`, `train_time_sec=26.5422`, `time_budget_hit=true`
+
+Decision:
+- Keep. Scale-up path and budget simulation are now operational and documented.
+
+Learnings:
+- Budget checks must include all training phases (main loop + QAT/teacher), not just the primary loop.
+- Larger architecture with compression can still stay far below 16 MB on toy pipeline.
+
+Next:
+- Run the same guardrail on CUDA desktop to retune `batch_size`/`time_budget_sec` for GPU throughput.
+- If frontier stalls, introduce a new mechanism inspired by recent Qwen/DeepSeek papers (e.g., expert routing, grouped low-rank adapters, or better distillation targets).

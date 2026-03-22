@@ -25,6 +25,7 @@ class QuantConfig:
     fallback_dtype: str = "fp16"
     pack_order: str = "state_dict"
     layer_bits: tuple[tuple[str, int], ...] = ()
+    sparse_2_4_pack: bool = False
 
 
 def _quant_bounds(bits: int) -> Tuple[int, int]:
@@ -95,6 +96,60 @@ def _pack_bits(q: torch.Tensor, bits: int) -> bytes:
     if acc_bits > 0:
         out.append(acc & 0xFF)
     return bytes(out)
+
+
+_PAIR_TO_CODE = {
+    (0, 1): 0,
+    (0, 2): 1,
+    (0, 3): 2,
+    (1, 2): 3,
+    (1, 3): 4,
+    (2, 3): 5,
+}
+
+
+def _sparse_2_4_payload(t: torch.Tensor, bits: int) -> bytes | None:
+    if t.ndim < 2 or bits < 2 or bits > 7:
+        return None
+    t2 = t.reshape(t.shape[0], -1).contiguous()
+    rows, cols = t2.shape
+    if cols < 4 or cols % 4 != 0:
+        return None
+    blocks = cols // 4
+    values: list[float] = []
+    codes: list[int] = []
+    for r in range(rows):
+        row = t2[r]
+        for b in range(blocks):
+            chunk = row[b * 4 : (b + 1) * 4]
+            nz = (chunk != 0).nonzero(as_tuple=False).view(-1)
+            if nz.numel() != 2:
+                return None
+            i0 = int(nz[0].item())
+            i1 = int(nz[1].item())
+            key = (i0, i1) if i0 < i1 else (i1, i0)
+            code = _PAIR_TO_CODE.get(key)
+            if code is None:
+                return None
+            codes.append(code)
+            values.append(float(chunk[i0].item()))
+            values.append(float(chunk[i1].item()))
+
+    if not values:
+        return None
+    vals = torch.tensor(values, dtype=torch.float32)
+    qvals = quantize_tensor_affine(vals, bits=bits)
+    qval_bytes = _pack_bits(qvals.qweight, bits=bits)
+    meta = torch.tensor(codes, dtype=torch.uint8)
+    meta_bytes = _pack_bits(meta, bits=3)
+    return b"".join(
+        [
+            meta_bytes,
+            qval_bytes,
+            qvals.scale.numpy().tobytes(),
+            qvals.zero_point.numpy().tobytes(),
+        ]
+    )
 
 
 def _parse_layer_bits(layer_bits: object) -> tuple[tuple[str, int], ...]:
@@ -271,6 +326,11 @@ def quantized_payload_bytes(model: nn.Module, cfg: QuantConfig) -> bytes:
             continue
         b = _bits_for_name(name, default_bits=int(cfg.bits), layer_bits=layer_bits)
         if b <= 7 and t.ndim >= 2:
+            if cfg.sparse_2_4_pack:
+                sparse_payload = _sparse_2_4_payload(t, bits=b)
+                if sparse_payload is not None:
+                    chunks.append(sparse_payload)
+                    continue
             qt = quantize_tensor_groupwise(t, bits=b, group_size=cfg.group_size)
             chunks.append(qt.packed_bytes or qt.qweight.numpy().tobytes())
             chunks.append(qt.scale.numpy().tobytes())

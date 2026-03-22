@@ -27,6 +27,12 @@ Progress tracker for local development and challenge readiness.
 - [x] Add and test hidden-state distillation probe (`run_hidden_distill_probe.py`).
 - [x] Add and test ALiBi positional encoding (`model.positional_encoding=alibi`).
 - [x] Add and test mixed-bit quantization (`quantize.layer_bits`, int3/int4 probe).
+- [x] Add and test attention-map distillation (`distill.attn_enabled`, `run_attn_distill_probe.py`).
+- [x] Add and test 2:4 pruning + sparse-aware packing (`prune.mode=nm2_4`, `quantize.sparse_2_4_pack`).
+- [x] Run tiny teacher/temperature retune probe (`run_teacher_retune_probe.py`).
+- [x] Run tight confirmation sweep around current toyfocus best (`run_toyfocus_confirm_probe.py`).
+- [x] Add and test multi-token prediction auxiliary loss (`mtp.*`, `run_mtp_probe.py`).
+- [x] Run 4-seed dual preset decision check (`run_dual_preset_seed_check.py`).
 - [x] Validate each feature with successful runs.
 - [x] Record per-feature tradeoffs in `memory.md`.
 
@@ -39,10 +45,10 @@ Progress tracker for local development and challenge readiness.
 
 ## Scale-Up
 
-- [ ] Move from toy corpus to larger local dataset slice.
-- [ ] Tune config for desktop GPUs.
-- [ ] Add timing budget simulation for stricter iteration.
-- [ ] Re-check artifact-size behavior under larger configs.
+- [x] Move from toy corpus to larger local dataset slice.
+- [x] Tune config for desktop GPUs.
+- [x] Add timing budget simulation for stricter iteration.
+- [x] Re-check artifact-size behavior under larger configs.
 
 ## Challenge Prep
 
@@ -56,3 +62,4 @@ Progress tracker for local development and challenge readiness.
 
 - [x] Append every meaningful experiment result to `memory.md`.
 - [x] Keep `checklist.md` status updated after each session.
+

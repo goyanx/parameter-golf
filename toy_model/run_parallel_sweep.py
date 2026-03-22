@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-workers", type=int, default=2)
     p.add_argument(
         "--mode",
-        choices=["light", "mixed", "chassis", "frontier", "micro", "refine", "tight", "full"],
+        choices=["light", "mixed", "chassis", "frontier", "micro", "refine", "tight", "toyfocus", "full"],
         default="light",
     )
     return p.parse_args()
@@ -119,6 +119,18 @@ def build_cases(base_cfg: dict, mode: str) -> list[tuple[str, dict]]:
         group_size_vals = [40]
         delay_fake_quant_vals = [20]
         temp_vals = [2.2, 2.3, 2.4]
+        kv_head_vals = [4]
+    elif mode == "toyfocus":
+        # Toy-only focus: test grouped-query attention around current compact frontier.
+        prune_vals = [0.10, 0.12]
+        qat_steps_vals = [90]
+        alpha_vals = [0.35]
+        teacher_steps_vals = [240]
+        lowrank_vals = [56]
+        group_size_vals = [40]
+        delay_fake_quant_vals = [20]
+        temp_vals = [2.2]
+        kv_head_vals = [1, 2, 4]
     else:
         prune_vals = [0.05, 0.10, 0.15]
         qat_steps_vals = [60, 90]
@@ -128,6 +140,10 @@ def build_cases(base_cfg: dict, mode: str) -> list[tuple[str, dict]]:
         group_size_vals = [64]
         delay_fake_quant_vals = [0]
         temp_vals = [2.5]
+        kv_head_vals = [4]
+
+    if "kv_head_vals" not in locals():
+        kv_head_vals = [4]
 
     grid = itertools.product(
         prune_vals,
@@ -138,13 +154,15 @@ def build_cases(base_cfg: dict, mode: str) -> list[tuple[str, dict]]:
         group_size_vals,
         delay_fake_quant_vals,
         temp_vals,
+        kv_head_vals,
     )
-    for prune_amt, qat_steps, alpha, teacher_steps, lowrank_rank, group_size, delay_fake_quant, temp in grid:
+    for prune_amt, qat_steps, alpha, teacher_steps, lowrank_rank, group_size, delay_fake_quant, temp, kv_heads in grid:
         idx += 1
         name = f"par_{idx:02d}"
         cfg = copy.deepcopy(base_cfg)
 
         cfg["lowrank"]["rank"] = lowrank_rank
+        cfg["model"]["attn_kv_heads"] = kv_heads
         cfg["prune"]["amount"] = prune_amt
         cfg["prune"]["progressive"] = True
         cfg["prune"]["start_step"] = 100

@@ -120,8 +120,20 @@ python train_gpt.py
 
 Keep all other hyperparameters fixed for fair comparison.
 
+## Smoke A/B Helper
+
+Use this helper to compare baseline vs `COMPRESSION_PRESET=toy_micro_best` quickly:
+
+```powershell
+python tools\run_main_smoke_compare.py --max-wallclock-seconds 120 --iterations 20000 --run-id-prefix runpod_smoke
+```
+
+Outputs:
+
+- logs under `logs/main_smoke_compare_<timestamp>/`
+- parsed summary JSON at `logs/main_smoke_compare_<timestamp>/summary.json`
+
 ## Notes
 
 - Defaults remain unchanged when new env vars are unset.
 - These knobs are calibration-stage controls; final record submissions should still prioritize reproducibility and size/bpb tradeoff validation.
-
